@@ -79,7 +79,7 @@
   ],
 
   "bot_name": "ConfluenceScalper",
-  "timeframe": "1m",
+  "timeframe": "5m",
 
   "telegram": {
     "enabled": true,

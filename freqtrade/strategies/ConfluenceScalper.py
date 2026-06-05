@@ -53,7 +53,7 @@ class ConfluenceScalper(IStrategy):
 
     # ── Metadata ───────────────────────────────────────────────────────────────
     INTERFACE_VERSION = 3
-    timeframe         = "1m"
+    timeframe         = "5m"
     can_short         = True        # Binance Futures — long AND short
 
     use_exit_signal            = True
@@ -93,10 +93,11 @@ class ConfluenceScalper(IStrategy):
     vol_mult       = 1.2
     swing_len      = 3
     atr_len        = 14
-    tp_mult        = 1.0    # TP at 1× ATR  (closer = higher win rate)
-    sl_mult        = 1.5    # SL at 1.5× ATR (wider = more breathing room)
+    tp_mult        = 1.5    # TP at 1.5× ATR — 5m moves are larger; 1.5:1 R:R
+    sl_mult        = 1.0    # SL at 1× ATR  — tight since entry is at VWAP support
     limit_offset   = 0.0002  # 0.02% inside close for maker fill probability
-    max_trade_bars = 30      # time stop: flatten if trade lives longer than this
+    max_trade_bars = 12      # 12 × 5m = 60-minute time stop
+    vwap_touch_pct = 0.003   # 0.3% proximity band around VWAP for bounce/rejection
 
     # ─────────────────────────────────────────────────────────────────────────
     # Indicators
@@ -156,60 +157,53 @@ class ConfluenceScalper(IStrategy):
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         df = dataframe
-
-        # ── MACD momentum helpers ──────────────────────────────────────────────
-        macd_xover  = (df["macd_line"] > df["macd_sig"]) & (df["macd_line"].shift(1) <= df["macd_sig"].shift(1))
-        macd_xunder = (df["macd_line"] < df["macd_sig"]) & (df["macd_line"].shift(1) >= df["macd_sig"].shift(1))
-
-        macd_bull = macd_xover | (
-            (df["macd_line"] > df["macd_sig"]) &
-            (df["macd_hist"] > df["macd_hist"].shift(1)) &
-            (df["macd_hist"] > 0)
-        )
-        macd_bear = macd_xunder | (
-            (df["macd_line"] < df["macd_sig"]) &
-            (df["macd_hist"] < df["macd_hist"].shift(1)) &
-            (df["macd_hist"] < 0)
-        )
-
-        # ── Market structure helpers ───────────────────────────────────────────
-        struct_valid = df["sh1"].notna() & df["sh2"].notna() & df["sl1"].notna() & df["sl2"].notna()
-        bull_ms = struct_valid & (df["sh1"] > df["sh2"]) & (df["sl1"] > df["sl2"])
-        bear_ms = struct_valid & (df["sh1"] < df["sh2"]) & (df["sl1"] < df["sl2"])
-        ema_accel_bull = df["ema_fast"] > df["ema_fast"].shift(5)
-        ema_accel_bear = df["ema_fast"] < df["ema_fast"].shift(5)
-
         vol_ok = df["volume"] > self.vol_mult * df["vol_sma"]
+
+        # ── VWAP bounce (long) ─────────────────────────────────────────────────
+        # Wick dipped within vwap_touch_pct above VWAP, candle closed above VWAP
+        # as a bullish bar — pullback-to-anchor demand-rejection entry.
+        vwap_touch_long  = df["low"]  <= df["vwap"] * (1.0 + self.vwap_touch_pct)
+        vwap_bounce_long = (
+            vwap_touch_long
+            & (df["close"] > df["vwap"])
+            & (df["close"] > df["open"])
+        )
+
+        # ── VWAP rejection (short) ─────────────────────────────────────────────
+        vwap_touch_short  = df["high"] >= df["vwap"] * (1.0 - self.vwap_touch_pct)
+        vwap_reject_short = (
+            vwap_touch_short
+            & (df["close"] < df["vwap"])
+            & (df["close"] < df["open"])
+        )
 
         # ── Long ───────────────────────────────────────────────────────────────
         long_cond = (
-            (df["ema_fast"] > df["ema_slow"])       &   # EMA: bullish structure
-            (df["st_dir"]   < 0)                    &   # Supertrend: bullish
-            (df["close"]    > df["vwap"])            &   # VWAP: above anchor
-            (bull_ms | ema_accel_bull)               &   # Market structure
-            (df["rsi"] > self.rsi_long_lo)           &   # RSI: not oversold
-            (df["rsi"] < self.rsi_long_hi)           &   # RSI: not overbought
-            macd_bull                                &   # MACD: momentum up
-            vol_ok                                   &   # Volume: real move
+            (df["ema_fast"] > df["ema_slow"])    &   # uptrend structure
+            (df["st_dir"]   < 0)                 &   # Supertrend bullish
+            vwap_bounce_long                     &   # VWAP bounce trigger
+            (df["rsi"] > self.rsi_long_lo)       &   # RSI not oversold
+            (df["rsi"] < self.rsi_long_hi)       &   # RSI not overbought
+            (df["macd_line"] > df["macd_sig"])   &   # MACD net bullish
+            vol_ok                               &   # volume confirmed
             (df["volume"] > 0)
         )
         dataframe.loc[long_cond,  "enter_long"]  = 1
-        dataframe.loc[long_cond,  "enter_tag"]   = "Long"
+        dataframe.loc[long_cond,  "enter_tag"]   = "VWAPBounce"
 
         # ── Short ──────────────────────────────────────────────────────────────
         short_cond = (
-            (df["ema_fast"] < df["ema_slow"])       &
-            (df["st_dir"]   > 0)                    &
-            (df["close"]    < df["vwap"])            &
-            (bear_ms | ema_accel_bear)               &
-            (df["rsi"] > self.rsi_short_lo)          &
-            (df["rsi"] < self.rsi_short_hi)          &
-            macd_bear                                &
-            vol_ok                                   &
+            (df["ema_fast"] < df["ema_slow"])    &
+            (df["st_dir"]   > 0)                 &
+            vwap_reject_short                    &
+            (df["rsi"] > self.rsi_short_lo)      &
+            (df["rsi"] < self.rsi_short_hi)      &
+            (df["macd_line"] < df["macd_sig"])   &
+            vol_ok                               &
             (df["volume"] > 0)
         )
         dataframe.loc[short_cond, "enter_short"] = 1
-        dataframe.loc[short_cond, "enter_tag"]   = "Short"
+        dataframe.loc[short_cond, "enter_tag"]   = "VWAPReject"
 
         return dataframe
 

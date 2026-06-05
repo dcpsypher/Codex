@@ -1,28 +1,33 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// CONFLUENCE SCALPER v1 — Binance USDC Futures
+// CONFLUENCE SCALPER v2 — 5m VWAP-Bounce  |  Binance USDC Futures
 // ══════════════════════════════════════════════════════════════════════════════
-// Designed for: BTC/USDC, ETH/USDC, SOL/USDC — 1m timeframe
-// Capital: $20 starting | Leverage: 10–30x
+// Designed for: BTC/USDC, ETH/USDC, SOL/USDC — 5m timeframe
+// Capital: $20 starting | Leverage: 10x
 // Fee model: Limit entries/TP = 0% maker | Stop-market SL = 0.04% taker
 //
 // Entry stack (ALL must confirm):
 //   Trend       — EMA 20 > EMA 50, Supertrend direction
-//   VWAP        — Price above/below VWAP (institutional bias)
-//   Structure   — Higher highs+lows (bull) / Lower highs+lows (bear)
-//   Momentum    — RSI in healthy zone, MACD histogram direction
+//   VWAP bounce — candle wick touched near VWAP then bounced (demand / supply zone)
+//   Momentum    — RSI in healthy zone, MACD line direction
 //   Volume      — Volume > threshold × Volume SMA
 //
+// Why VWAP bounce?
+//   On 1m charts, EMA+MACD flip 15-20×/day → too many false entries + fee drag.
+//   On 5m charts, entering ONLY at VWAP pullbacks gives 3-5 high-quality setups/day:
+//   price returning to the institutional volume-weighted anchor and rejecting is a
+//   proven edge in futures markets.
+//
 // Exits:
-//   Take-profit — Limit order at 2× ATR (maker, 0% fee)
-//   Stop-loss   — Stop-market at 1× ATR (taker, 0.04% fee)
-//   Breakeven   — SL moved to entry after 1× ATR profit secured
-//   Time stop   — Flat after N bars regardless
+//   Take-profit — Limit order at 1.5× ATR (maker, 0% fee)
+//   Stop-loss   — Stop-market at 1.0× ATR  (taker, 0.04% fee)
+//   Time stop   — Flat after 12 bars (= 60 min) regardless
+//   R:R = 1.5:1  →  breakeven win-rate ≈ 40%  (target ≥ 55%)
 // ══════════════════════════════════════════════════════════════════════════════
 
 //@version=6
 strategy(
-    title               = "Confluence Scalper v1 — Binance USDC Futures",
-    shorttitle          = "CS_v1",
+    title               = "Confluence Scalper v2 — 5m VWAP Bounce",
+    shorttitle          = "CS_v2_5m",
     overlay             = true,
     initial_capital     = 20,
     default_qty_type    = strategy.percent_of_equity,
@@ -45,6 +50,12 @@ i_emaSlow    = input.int(50,    "EMA Slow Length",          group = "Trend",    
 i_stFactor   = input.float(3.0, "Supertrend Factor",        group = "Trend",            step = 0.1, minval = 1.0)
 i_stAtrLen   = input.int(7,     "Supertrend ATR Length",    group = "Trend",            minval = 1)
 
+// — VWAP Bounce —
+i_vwapTouchPct = input.float(0.3, "VWAP Touch Band %",      group = "VWAP Bounce",
+     step = 0.05, minval = 0.05,
+     tooltip = "Candle wick must reach within this % of VWAP to qualify as a bounce/rejection. " +
+               "Lower = stricter proximity; higher = looser.")
+
 // — Momentum —
 i_rsiLen     = input.int(14,    "RSI Length",               group = "Momentum",         minval = 2)
 i_rsiLongLo  = input.int(40,    "RSI Long Min",             group = "Momentum",         tooltip = "Don't enter long below this RSI")
@@ -57,22 +68,24 @@ i_macdSig    = input.int(9,     "MACD Signal",              group = "Momentum")
 
 // — Volume —
 i_volLen     = input.int(20,    "Volume SMA Length",        group = "Volume")
-i_volMult    = input.float(1.2, "Volume Multiplier",        group = "Volume",           step = 0.1, tooltip = "Volume must exceed this × SMA to confirm signal")
-
-// — Market Structure —
-i_swingLen   = input.int(3,     "Swing Pivot Bars (L & R)", group = "Market Structure", minval = 1, tooltip = "Bars left+right to confirm a swing pivot")
+i_volMult    = input.float(1.2, "Volume Multiplier",        group = "Volume",           step = 0.1)
 
 // — Risk Management —
 i_atrLen     = input.int(14,    "ATR Length",               group = "Risk Management")
-i_tpMult     = input.float(1.0, "TP ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Take-profit distance = this × ATR. For HIGH win rate keep TP <= SL.")
-i_slMult     = input.float(1.5, "SL ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Stop-loss distance = this × ATR. Wider SL than TP => higher win rate.")
-i_limitOff   = input.float(0.02,"Limit Entry Offset %",     group = "Risk Management",  step = 0.01, tooltip = "Place limit this % inside close for maker fill probability")
-i_maxBars    = input.int(30,    "Max Bars in Trade (Time Stop)", group = "Risk Management", minval = 1)
+i_tpMult     = input.float(1.5, "TP ATR Multiplier",        group = "Risk Management",  step = 0.1,
+     tooltip = "Take-profit = this × ATR. Default 1.5 gives 1.5:1 R:R vs 1× ATR stop-loss.")
+i_slMult     = input.float(1.0, "SL ATR Multiplier",        group = "Risk Management",  step = 0.1,
+     tooltip = "Stop-loss = this × ATR. 1× is tight but valid — entry is at VWAP support/resistance.")
+i_limitOff   = input.float(0.02,"Limit Entry Offset %",     group = "Risk Management",  step = 0.01)
+i_maxBars    = input.int(12,    "Max Bars in Trade (Time Stop)", group = "Risk Management",
+     minval = 1, tooltip = "12 bars × 5m = 60-minute maximum hold time.")
 i_leverage   = input.int(10,    "Display Leverage",         group = "Risk Management",  tooltip = "Informational only — set actual leverage on Binance")
 
 // — Breakeven Trail —
-i_beEnable   = input.bool(false,"Enable Breakeven Trail",   group = "Breakeven", tooltip = "OFF by default. When ON, SL moves to entry only AFTER price reaches the trigger fraction of TP — so it no longer strangles winners early.")
-i_beTrigger  = input.float(0.7, "BE Trigger (fraction of TP)", group = "Breakeven", step = 0.05, minval = 0.1, maxval = 1.0, tooltip = "Move SL to breakeven once price travels this fraction of the way to TP.")
+i_beEnable   = input.bool(false,"Enable Breakeven Trail",   group = "Breakeven",
+     tooltip = "OFF by default. When ON, moves SL to entry after price travels i_beTrigger fraction of the TP distance.")
+i_beTrigger  = input.float(0.7, "BE Trigger (fraction of TP)", group = "Breakeven",
+     step = 0.05, minval = 0.1, maxval = 1.0)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // INDICATOR CALCULATIONS
@@ -89,7 +102,7 @@ emaBear = emaFast < emaSlow
 stBull = stDir < 0
 stBear = stDir > 0
 
-// Trend — VWAP (resets each trading session)
+// VWAP (resets each trading session — midnight UTC for crypto)
 vwapVal = ta.vwap(hlc3)
 
 // Momentum — RSI
@@ -102,56 +115,40 @@ rsi = ta.rsi(close, i_rsiLen)
 volSma = ta.sma(volume, i_volLen)
 volOk  = volume > i_volMult * volSma
 
-// Market Structure — swing pivot tracking
-swH = ta.pivothigh(high, i_swingLen, i_swingLen)
-swL = ta.pivotlow(low,   i_swingLen, i_swingLen)
-
-var float sh1 = na
-var float sh2 = na
-var float sl1 = na
-var float sl2 = na
-
-if not na(swH)
-    sh2 := sh1
-    sh1 := swH
-
-if not na(swL)
-    sl2 := sl1
-    sl1 := swL
-
-// Higher highs AND higher lows  → bullish structure
-// Lower highs AND lower lows    → bearish structure
-bullMS = not na(sh1) and not na(sh2) and not na(sl1) and not na(sl2) and sh1 > sh2 and sl1 > sl2
-bearMS = not na(sh1) and not na(sh2) and not na(sl1) and not na(sl2) and sh1 < sh2 and sl1 < sl2
-
-// ATR (used for dynamic SL/TP)
+// ATR (dynamic SL/TP sizing)
 atr = ta.atr(i_atrLen)
 
 // ──────────────────────────────────────────────────────────────────────────────
-// SIGNAL CONDITIONS
+// VWAP BOUNCE / REJECTION CONDITIONS
 // ──────────────────────────────────────────────────────────────────────────────
 
-// MACD momentum: fresh histogram cross OR histogram accelerating in direction
-macdBullish = ta.crossover(macdLine, sigLine) or (macdLine > sigLine and histLine > histLine[1] and histLine > 0)
-macdBearish = ta.crossunder(macdLine, sigLine) or (macdLine < sigLine and histLine < histLine[1] and histLine < 0)
+vwapBand = i_vwapTouchPct / 100.0
 
-// — Long: all 6 layers agree —
-longSignal = emaBull                                  // EMA trend: fast above slow
-          and stBull                                  // Supertrend: bullish
-          and close > vwapVal                         // VWAP: price above institutional anchor
-          and (bullMS or emaFast > emaFast[5])        // Structure: HH/HL or EMA accelerating
-          and rsi > i_rsiLongLo and rsi < i_rsiLongHi // RSI: healthy momentum, not overbought
-          and macdBullish                             // MACD: momentum confirms direction
-          and volOk                                   // Volume: real participation
-          and strategy.position_size == 0             // No open position
+// Long bounce: wick touched near VWAP from above, closed above VWAP as a bullish candle
+vwapTouchLong  = low <= vwapVal * (1.0 + vwapBand)
+vwapBounceLong = vwapTouchLong and close > vwapVal and close > open
 
-// — Short: all 6 layers agree —
+// Short rejection: wick touched near VWAP from below, closed below VWAP as a bearish candle
+vwapTouchShort  = high >= vwapVal * (1.0 - vwapBand)
+vwapRejectShort = vwapTouchShort and close < vwapVal and close < open
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ENTRY SIGNALS
+// ──────────────────────────────────────────────────────────────────────────────
+
+longSignal = emaBull                                        // EMA: uptrend structure
+          and stBull                                        // Supertrend: bullish
+          and vwapBounceLong                                // VWAP bounce trigger
+          and rsi > i_rsiLongLo and rsi < i_rsiLongHi      // RSI: healthy range
+          and macdLine > sigLine                            // MACD: net bullish
+          and volOk                                         // Volume: real participation
+          and strategy.position_size == 0                   // No open position
+
 shortSignal = emaBear
            and stBear
-           and close < vwapVal
-           and (bearMS or emaFast < emaFast[5])
+           and vwapRejectShort
            and rsi > i_rsiShortLo and rsi < i_rsiShortHi
-           and macdBearish
+           and macdLine < sigLine
            and volOk
            and strategy.position_size == 0
 
@@ -163,12 +160,12 @@ longLimitPx  = close * (1 - i_limitOff / 100)
 shortLimitPx = close * (1 + i_limitOff / 100)
 
 if longSignal
-    strategy.cancel("Short")                // cancel any pending opposite order
-    strategy.entry("Long", strategy.long,  limit = longLimitPx, comment = "Long")
+    strategy.cancel("Short")
+    strategy.entry("Long", strategy.long,  limit = longLimitPx, comment = "VWAPBounce")
 
 if shortSignal
     strategy.cancel("Long")
-    strategy.entry("Short", strategy.short, limit = shortLimitPx, comment = "Short")
+    strategy.entry("Short", strategy.short, limit = shortLimitPx, comment = "VWAPReject")
 
 // Cancel pending order if conditions flip before fill
 if strategy.position_size == 0
@@ -187,13 +184,11 @@ var float sTp   = na
 var float sSl   = na
 var int   barsIn = 0
 
-// Bars-in-trade counter
 if strategy.position_size != 0
     barsIn += 1
 else
     barsIn := 0
 
-// Set TP/SL the bar that position opens (limit just filled)
 if strategy.position_size > 0 and strategy.position_size[1] == 0
     lTp := strategy.position_avg_price + i_tpMult * atr
     lSl := strategy.position_avg_price - i_slMult * atr
@@ -212,9 +207,7 @@ if strategy.position_size < 0 and strategy.position_size[1] == 0
          comment_profit = "Short TP",
          comment_loss   = "Short SL")
 
-// Breakeven trail (OPT-IN) — moves SL to entry only after price has traveled
-// i_beTrigger fraction of the way to TP, so it no longer converts early-momentum
-// winners into breakeven scratches. Disabled by default.
+// Breakeven trail (opt-in) — fires only after price has moved i_beTrigger × TP distance
 if i_beEnable and strategy.position_size > 0 and not na(lSl) and not na(lTp)
     entryPx  = strategy.position_avg_price
     beLevel  = entryPx + i_beTrigger * (lTp - entryPx)
@@ -237,7 +230,7 @@ if i_beEnable and strategy.position_size < 0 and not na(sSl) and not na(sTp)
              comment_profit = "Short TP",
              comment_loss   = "Short BE")
 
-// Time stop — flatten if trade hasn't resolved within maxBars candles
+// Time stop — flatten after maxBars candles (60 min at 5m default)
 if strategy.position_size != 0 and barsIn >= i_maxBars
     strategy.close_all(comment = "Time Stop")
     strategy.cancel_all()
@@ -247,13 +240,17 @@ if strategy.position_size != 0 and barsIn >= i_maxBars
 // ──────────────────────────────────────────────────────────────────────────────
 
 // EMA ribbon with fill
-p_emaF = plot(emaFast, "EMA 20", color = color.new(color.blue, 15), linewidth = 1)
+p_emaF = plot(emaFast, "EMA 20", color = color.new(color.blue, 15),   linewidth = 1)
 p_emaS = plot(emaSlow, "EMA 50", color = color.new(color.orange, 10), linewidth = 2)
 fill(p_emaF, p_emaS,
      color = emaBull ? color.new(color.green, 90) : color.new(color.red, 90))
 
 // VWAP
 plot(vwapVal, "VWAP", color = color.new(color.purple, 25), linewidth = 1, style = plot.style_circles)
+
+// VWAP touch band (dashed lines showing the bounce zone)
+plot(vwapVal * (1 + i_vwapTouchPct / 100), "VWAP Band +", color = color.new(color.purple, 75), linewidth = 1, style = plot.style_cross)
+plot(vwapVal * (1 - i_vwapTouchPct / 100), "VWAP Band -", color = color.new(color.purple, 75), linewidth = 1, style = plot.style_cross)
 
 // Supertrend (color-coded)
 stClr = stBull ? color.new(color.lime, 25) : color.new(color.red, 25)
@@ -266,8 +263,8 @@ plot(strategy.position_size < 0 ? sTp : na, "Short TP", color = color.new(color.
 plot(strategy.position_size < 0 ? sSl : na, "Short SL", color = color.new(color.red, 0),   linewidth = 1, style = plot.style_linebr)
 
 // Entry signal arrows
-plotshape(longSignal,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),   size = size.small)
-plotshape(shortSignal, "Short Entry", shape.triangledown, location.abovebar, color.new(color.red, 0),    size = size.small)
+plotshape(longSignal,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),  size = size.small)
+plotshape(shortSignal, "Short Entry", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.small)
 
 // Trade background shading
 bgcolor(strategy.position_size > 0 ? color.new(color.green, 94)
@@ -290,32 +287,29 @@ var table dash = table.new(
      frame_width  = 1)
 
 if barstate.islast
-    // ── helpers ──
-    ct = strategy.closedtrades
-    winPct   = ct > 0 ? strategy.wintrades / ct * 100 : 0.0
-    lossAmt  = math.abs(strategy.grossloss)
-    pf       = strategy.grossprofit > 0 and lossAmt > 0 ? strategy.grossprofit / lossAmt : 0.0
-    pnlColor = strategy.netprofit >= 0 ? color.lime : color.red
-    wrColor  = winPct >= 60 ? color.lime : winPct >= 45 ? color.yellow : color.red
-    pfColor  = pf >= 1.5 ? color.lime : pf >= 1.0 ? color.yellow : color.red
+    ct      = strategy.closedtrades
+    winPct  = ct > 0 ? strategy.wintrades / ct * 100 : 0.0
+    lossAmt = math.abs(strategy.grossloss)
+    pf      = strategy.grossprofit > 0 and lossAmt > 0 ? strategy.grossprofit / lossAmt : 0.0
+    pnlClr  = strategy.netprofit >= 0 ? color.lime : color.red
+    wrClr   = winPct >= 55 ? color.lime : winPct >= 45 ? color.yellow : color.red
+    pfClr   = pf >= 1.5 ? color.lime : pf >= 1.0 ? color.yellow : color.red
 
     trendTxt = emaBull ? "BULLISH" : emaBear ? "BEARISH" : "NEUTRAL"
     trendClr = emaBull ? color.lime : emaBear ? color.red : color.gray
     stTxt    = stBull  ? "BULLISH" : "BEARISH"
     stClr2   = stBull  ? color.lime : color.red
 
-    // ── header ──
-    table.cell(dash, 0, 0, "CONFLUENCE SCALPER v1",
+    table.cell(dash, 0, 0, "CS v2 — 5m VWAP Bounce",
          text_color = color.white, text_size = size.small,
          bgcolor = color.new(color.navy, 40))
     table.cell(dash, 1, 0, "Binance USDC Futures",
          text_color = color.yellow, text_size = size.tiny,
          bgcolor = color.new(color.navy, 40))
 
-    // ── performance ──
     table.cell(dash, 0, 1, "Net P&L",       text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 1, "$" + str.tostring(math.round(strategy.netprofit, 2)),
-         text_color = pnlColor, text_size = size.tiny)
+         text_color = pnlClr, text_size = size.tiny)
 
     table.cell(dash, 0, 2, "Equity",        text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 2, "$" + str.tostring(math.round(strategy.equity, 2)),
@@ -323,16 +317,15 @@ if barstate.islast
 
     table.cell(dash, 0, 3, "Win Rate",      text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 3, str.tostring(math.round(winPct, 1)) + "%",
-         text_color = wrColor, text_size = size.tiny)
+         text_color = wrClr, text_size = size.tiny)
 
     table.cell(dash, 0, 4, "Profit Factor", text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 4, str.tostring(math.round(pf, 2)),
-         text_color = pfColor, text_size = size.tiny)
+         text_color = pfClr, text_size = size.tiny)
 
     table.cell(dash, 0, 5, "Trades",        text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 5, str.tostring(ct), text_color = color.white, text_size = size.tiny)
 
-    // ── config ──
     table.cell(dash, 0, 6, "Leverage",      text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 6, str.tostring(i_leverage) + "x",
          text_color = color.white, text_size = size.tiny)
@@ -343,7 +336,6 @@ if barstate.islast
     table.cell(dash, 0, 8, "Taker Fee",     text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 8, "0.04% (SL)",    text_color = color.yellow, text_size = size.tiny)
 
-    // ── live signal state ──
     table.cell(dash, 0, 9,  "EMA Trend",    text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 9,  trendTxt,       text_color = trendClr,     text_size = size.tiny)
 

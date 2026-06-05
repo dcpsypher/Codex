@@ -52,7 +52,15 @@ def fetch_ohlcv(
         return df
 
     ex = _get_exchange()
-    bars_per_month = 30 * 24 * 60  # 1m bars
+    # Parse timeframe to minutes so progress estimate works for any resolution.
+    tf_lower = timeframe.lower()
+    if tf_lower.endswith("h"):
+        tf_minutes = int(tf_lower[:-1]) * 60
+    elif tf_lower.endswith("d"):
+        tf_minutes = int(tf_lower[:-1]) * 1440
+    else:
+        tf_minutes = int(tf_lower.rstrip("m") or 1)
+    bars_per_month = (30 * 24 * 60) // max(tf_minutes, 1)
     total_needed = months * bars_per_month
     since_ms = ex.milliseconds() - months * 30 * 24 * 60 * 60 * 1000
 

@@ -44,7 +44,7 @@ def main() -> None:
     for sym in symbols:
         console.print(f"[bold white]▶ {sym}[/bold white]")
         try:
-            raw = fetch_ohlcv(sym, "1m", args.months)
+            raw = fetch_ohlcv(sym, "5m", args.months)
         except Exception as e:
             console.print(f"  [red]Data fetch failed: {e}[/red]")
             continue
@@ -67,12 +67,13 @@ def main() -> None:
 
     # ── Best config summary ───────────────────────────────────────────────
     best = all_results[0]
-    console.print("\n[bold green]✓ Best config to plug into Pine Script:[/bold green]")
+    console.print("\n[bold green]✓ Best config to plug into Pine Script / DEFAULT_PARAMS:[/bold green]")
     console.print(
-        f"  TP mult   = [cyan]{best['tp_mult']}[/cyan]\n"
-        f"  SL mult   = [cyan]{best['sl_mult']}[/cyan]\n"
-        f"  RSI Long  = [cyan]{best['rsi_long_lo']} – {best['rsi_long_hi']}[/cyan]\n"
-        f"  Vol mult  = [cyan]{best['vol_mult']}[/cyan]\n"
+        f"  TP mult        = [cyan]{best['tp_mult']}[/cyan]\n"
+        f"  SL mult        = [cyan]{best['sl_mult']}[/cyan]\n"
+        f"  RSI Long range = [cyan]{best['rsi_long_lo']} – {best['rsi_long_hi']}[/cyan]\n"
+        f"  Vol mult       = [cyan]{best['vol_mult']}[/cyan]\n"
+        f"  VWAP touch %   = [cyan]{best.get('vwap_touch_pct', 0.003):.3f}[/cyan]\n"
         f"  (All other params unchanged from defaults)\n"
     )
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Run a single backtest for one or more symbols.
+Run a single backtest for one or more symbols — 5m VWAP-Bounce strategy.
 
 Usage:
     python run_backtest.py                                # defaults: BTC+ETH+SOL, 3 months
     python run_backtest.py --symbol BTC/USDT:USDT
     python run_backtest.py --months 6
-    python run_backtest.py --tp 1.0 --sl 1.5            # custom TP/SL multipliers
+    python run_backtest.py --tp 1.5 --sl 1.0            # custom TP/SL multipliers
     python run_backtest.py --refresh                     # force re-download data
 """
 
@@ -28,12 +28,12 @@ console = Console()
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_PARAMS = {
-    # Trend
+    # ── Trend ──────────────────────────────────────────────────────────────
     "ema_fast":        20,
     "ema_slow":        50,
     "st_factor":       3.0,
     "st_atr_len":      7,
-    # Momentum
+    # ── Momentum ───────────────────────────────────────────────────────────
     "rsi_len":         14,
     "rsi_long_lo":     40,
     "rsi_long_hi":     65,
@@ -42,21 +42,25 @@ DEFAULT_PARAMS = {
     "macd_fast":       12,
     "macd_slow":       26,
     "macd_signal":     9,
-    # Volume
+    # ── Volume ─────────────────────────────────────────────────────────────
     "vol_len":         20,
     "vol_mult":        1.2,
-    # Market structure
+    # ── Market structure (still computed for debugging, not used in signals) ─
     "swing_len":       3,
-    # Risk management
+    # ── VWAP bounce entry trigger ──────────────────────────────────────────
+    # Low must be within this % above VWAP for a long bounce to count.
+    # High must be within this % below VWAP for a short rejection to count.
+    "vwap_touch_pct":  0.003,   # 0.3 % proximity band
+    # ── Risk management ────────────────────────────────────────────────────
     "atr_len":         14,
-    "tp_mult":         1.0,     # TP at 1× ATR  (closer TP → higher win rate)
-    "sl_mult":         1.5,     # SL at 1.5× ATR (wider SL → lets trades breathe)
+    "tp_mult":         1.5,     # TP at 1.5× ATR — 5m moves are larger; good R:R
+    "sl_mult":         1.0,     # SL at 1× ATR  — tight since entry is at VWAP support
     "limit_offset_pct": 0.02,
-    "max_bars":        30,
-    # Exchange / account
+    "max_bars":        12,      # 12 × 5m = 60-minute time stop
+    # ── Exchange / account ─────────────────────────────────────────────────
     "leverage":           10,
     "initial_capital":    20.0,
-    "risk_per_trade_pct": 1.5,  # risk 1.5% of equity per trade (ATR-sized SL)
+    "risk_per_trade_pct": 1.5,  # risk 1.5% of equity per trade
     "maker_fee":          0.0,  # 0% on Binance USDC/USDT limit orders
     "taker_fee":          0.0004,  # 0.04% taker (SL / time stop exits)
 }
@@ -92,7 +96,7 @@ def main() -> None:
     for sym in symbols:
         console.print(f"[bold]{sym}[/bold]")
         try:
-            raw = fetch_ohlcv(sym, "1m", args.months, force_refresh=args.refresh)
+            raw = fetch_ohlcv(sym, "5m", args.months, force_refresh=args.refresh)
         except Exception as e:
             console.print(f"  [red]Data fetch failed: {e}[/red]")
             continue
