@@ -39,14 +39,14 @@ class Trade:
 
 @dataclass
 class EngineState:
-    state:        str   = "flat"          # flat | pending_long | pending_short | long | short
-    limit_price:  float = 0.0
-    entry_price:  float = 0.0
-    tp_price:     float = 0.0
-    sl_price:     float = 0.0
-    entry_bar:    int   = 0
-    bars_in:      int   = 0
-    pending_signal_bar: int = -1          # bar that generated the pending order
+    state:            str   = "flat"   # flat | pending_long | pending_short | long | short
+    limit_price:      float = 0.0
+    entry_price:      float = 0.0
+    tp_price:         float = 0.0
+    sl_price:         float = 0.0
+    position_notional: float = 0.0     # dollar notional of this trade (risk-sized)
+    entry_bar:        int   = 0
+    bars_in:          int   = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,14 +61,18 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
         trades     : list of Trade objects
         equity_curve: pd.Series aligned to df.index
     """
-    capital   = float(params["initial_capital"])
-    leverage  = float(params["leverage"])
-    maker_fee = float(params["maker_fee"])   # 0.0 for limit orders
-    taker_fee = float(params["taker_fee"])   # 0.0004 for market/stop orders
-    lim_off   = float(params["limit_offset_pct"]) / 100.0
-    tp_mult   = float(params["tp_mult"])
-    sl_mult   = float(params["sl_mult"])
-    max_bars  = int(params["max_bars"])
+    capital        = float(params["initial_capital"])
+    max_leverage   = float(params["leverage"])
+    maker_fee      = float(params["maker_fee"])
+    taker_fee      = float(params["taker_fee"])
+    lim_off        = float(params["limit_offset_pct"]) / 100.0
+    tp_mult        = float(params["tp_mult"])
+    sl_mult        = float(params["sl_mult"])
+    max_bars       = int(params["max_bars"])
+    # Risk-based sizing: each trade risks at most this % of current equity.
+    # Keeps the account alive even through losing streaks — the single most
+    # important parameter for real money trading.
+    risk_per_trade = float(params.get("risk_per_trade_pct", 1.5)) / 100.0
 
     equity = capital
     s = EngineState()
@@ -95,11 +99,19 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
             if not long_c[i - 1]:
                 s.state = "flat"
             elif l <= s.limit_price:
-                # Filled — set TP/SL based on ATR at fill bar
                 atr_val = atrs[i]
                 s.entry_price = s.limit_price
                 s.tp_price    = s.entry_price + tp_mult * atr_val
                 s.sl_price    = s.entry_price - sl_mult * atr_val
+                # Risk-based position sizing:
+                #   notional = (equity × risk%) / (sl_distance%)
+                #   capped at max_leverage × equity
+                sl_dist_pct = (s.entry_price - s.sl_price) / s.entry_price
+                if sl_dist_pct > 0:
+                    raw_notional = equity * risk_per_trade / sl_dist_pct
+                else:
+                    raw_notional = equity * max_leverage
+                s.position_notional = min(raw_notional, equity * max_leverage)
                 s.state       = "long"
                 s.entry_bar   = i
                 s.bars_in     = 0
@@ -112,6 +124,12 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
                 s.entry_price = s.limit_price
                 s.tp_price    = s.entry_price - tp_mult * atr_val
                 s.sl_price    = s.entry_price + sl_mult * atr_val
+                sl_dist_pct = (s.sl_price - s.entry_price) / s.entry_price
+                if sl_dist_pct > 0:
+                    raw_notional = equity * risk_per_trade / sl_dist_pct
+                else:
+                    raw_notional = equity * max_leverage
+                s.position_notional = min(raw_notional, equity * max_leverage)
                 s.state       = "short"
                 s.entry_bar   = i
                 s.bars_in     = 0
@@ -142,12 +160,13 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
                 exit_type = None
 
             if exit_px is not None:
-                fee = maker_fee if exit_type == "tp" else taker_fee
+                fee     = maker_fee if exit_type == "tp" else taker_fee
                 raw_pct = (exit_px - s.entry_price) / s.entry_price
-                # Entry was a limit order → 0% entry fee always
                 net_pct = raw_pct - fee
-                pnl     = equity * leverage * net_pct
-                equity  = max(equity + pnl, 0.0)   # floor at 0 (liquidated)
+                # P&L = notional × net price move %  (entry limit = 0% fee)
+                pnl     = s.position_notional * net_pct
+                equity  = max(equity + pnl, 0.0)
+                eff_lev = s.position_notional / max(equity, 1e-9)
 
                 trades.append(Trade(
                     entry_bar    = s.entry_bar,
@@ -157,7 +176,7 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
                     exit_price   = exit_px,
                     exit_type    = exit_type,
                     pnl          = pnl,
-                    pnl_pct      = net_pct * leverage * 100,
+                    pnl_pct      = net_pct * eff_lev * 100,
                     equity_after = equity,
                 ))
                 s = EngineState()
@@ -185,11 +204,12 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
                 exit_type = None
 
             if exit_px is not None:
-                fee = maker_fee if exit_type == "tp" else taker_fee
+                fee     = maker_fee if exit_type == "tp" else taker_fee
                 raw_pct = (s.entry_price - exit_px) / s.entry_price
                 net_pct = raw_pct - fee
-                pnl     = equity * leverage * net_pct
+                pnl     = s.position_notional * net_pct
                 equity  = max(equity + pnl, 0.0)
+                eff_lev = s.position_notional / max(equity, 1e-9)
 
                 trades.append(Trade(
                     entry_bar    = s.entry_bar,
@@ -199,7 +219,7 @@ def run_backtest(df: pd.DataFrame, params: dict) -> tuple[list[Trade], pd.Series
                     exit_price   = exit_px,
                     exit_type    = exit_type,
                     pnl          = pnl,
-                    pnl_pct      = net_pct * leverage * 100,
+                    pnl_pct      = net_pct * eff_lev * 100,
                     equity_after = equity,
                 ))
                 s = EngineState()

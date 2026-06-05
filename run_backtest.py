@@ -54,10 +54,11 @@ DEFAULT_PARAMS = {
     "limit_offset_pct": 0.02,
     "max_bars":        30,
     # Exchange / account
-    "leverage":        10,
-    "initial_capital": 20.0,
-    "maker_fee":       0.0,     # 0% on Binance USDC/USDT limit orders
-    "taker_fee":       0.0004,  # 0.04% taker (SL / time stop exits)
+    "leverage":           10,
+    "initial_capital":    20.0,
+    "risk_per_trade_pct": 1.5,  # risk 1.5% of equity per trade (ATR-sized SL)
+    "maker_fee":          0.0,  # 0% on Binance USDC/USDT limit orders
+    "taker_fee":          0.0004,  # 0.04% taker (SL / time stop exits)
 }
 
 DEFAULT_SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
