@@ -1,24 +1,43 @@
 {
   "$schema": "https://schema.freqtrade.io/schema.json",
 
-  "_comment": "LIVE CONFIG — dry_run: true for paper trading, false for real money. Start with dry_run: true!",
+  "_comment_safety": "KEEP dry_run: true for at least 2 weeks of paper trading before going live.",
 
   "max_open_trades": 1,
   "stake_currency": "USDC",
   "stake_amount": "unlimited",
   "tradable_balance_ratio": 0.95,
   "fiat_display_currency": "USD",
+
+  "_comment_dryrun": "Set to false ONLY after 2+ weeks of profitable dry-run results.",
   "dry_run": true,
   "dry_run_wallet": 20,
 
   "cancel_open_orders_on_exit": true,
 
+  "unfilledtimeout": {
+    "_comment": "Cancel unfilled limit entries after 5 minutes so stale orders don't fill at wrong prices.",
+    "entry": 5,
+    "exit": 10,
+    "unit": "minutes",
+    "exit_timeout_count": 0
+  },
+
   "trading_mode": "futures",
   "margin_mode": "isolated",
   "liquidation_buffer": 0.05,
 
+  "leverage_config": {
+    "_comment": "Sets leverage per pair. Start at 10x; increase only after 50+ live trades.",
+    "BTC/USDC:USDC": 10,
+    "ETH/USDC:USDC": 10,
+    "SOL/USDC:USDC": 10
+  },
+
   "exchange": {
     "name": "binance",
+    "_comment_keys": "Add your API keys here directly on your machine. NEVER share keys in chat or commit them to git.",
+    "_comment_perms": "Required permissions: Enable Reading + Enable Futures. Disable withdrawals.",
     "key": "YOUR_BINANCE_API_KEY",
     "secret": "YOUR_BINANCE_API_SECRET",
     "ccxt_config": {
@@ -59,12 +78,12 @@
     }
   ],
 
-  "bot_name": "ConfluenceScalper-LIVE",
+  "bot_name": "ConfluenceScalper",
   "timeframe": "1m",
 
   "telegram": {
     "enabled": true,
-    "_comment": "Get bot token from @BotFather and your chat_id from @userinfobot",
+    "_comment": "1) Go to @BotFather on Telegram → /newbot → copy the token below. 2) Message @userinfobot to get your chat_id.",
     "token": "YOUR_TELEGRAM_BOT_TOKEN",
     "chat_id": "YOUR_TELEGRAM_CHAT_ID",
     "notification_settings": {
@@ -87,7 +106,8 @@
   },
 
   "api_server": {
-    "enabled": true,
+    "enabled": false,
+    "_comment": "Enable for Freqtrade UI (FreqUI). Replace secrets before enabling.",
     "listen_ip_address": "127.0.0.1",
     "listen_port": 8080,
     "verbosity": "error",

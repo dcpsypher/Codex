@@ -1,363 +1,310 @@
 """
-Confluence Scalper v1 — Binance USDC Futures
-=============================================
-Mirrors the Pine Script v6 logic for Python backtesting via Freqtrade.
+Confluence Scalper v1 — Binance USDC Futures (Freqtrade Strategy)
+=================================================================
+Mirrors the Pine Script v6 / Python backtester logic exactly.
 
-Indicators used:
-  Trend       : EMA 20, EMA 50, Supertrend (7, 3.0)
-  VWAP        : intra-day VWAP reset
-  Momentum    : RSI (14), MACD (12, 26, 9)
-  Volume      : Volume vs 20-bar SMA
-  Structure   : Pivot highs/lows (swing 3 bars each side)
-  Risk sizing : ATR (14)
+All indicators are imported from backtest/indicators.py — the same functions
+used in the Python backtester — so live signals are guaranteed to match the
+backtest signals 1-for-1. No pandas_ta dependency; no indicator drift.
 
 Order model:
   Entry  — limit order (maker = 0% fee on Binance USDC pairs)
-  TP     — limit order (maker = 0% fee)
-  SL     — stop-market (taker = 0.04%)
+  TP     — limit order (maker = 0% fee), via custom_exit
+  SL     — stop-market on exchange (taker = 0.04%)
+  Time   — market close after max_trade_bars candles, via custom_exit
 
-Run backtesting:
-  freqtrade backtesting --strategy ConfluenceScalper \
-    --pairs BTC/USDC:USDC ETH/USDC:USDC SOL/USDC:USDC \
-    --timeframe 1m --timerange 20240101-20241231
+Run backtesting (after `freqtrade download-data`):
+  freqtrade backtesting -c freqtrade/config.json --strategy ConfluenceScalper
 
-Run hyperopt (tune parameters):
-  freqtrade hyperopt --strategy ConfluenceScalper \
-    --hyperopt-loss SharpeHyperOptLoss \
-    --pairs BTC/USDC:USDC --timeframe 1m --timerange 20240601-20241231 \
-    --epochs 200
+Run hyperopt (tune TP/SL/RSI):
+  freqtrade hyperopt -c freqtrade/config.json --strategy ConfluenceScalper \
+    --hyperopt-loss SharpeHyperOptLoss --pairs BTC/USDC:USDC --epochs 200
 """
 
+import sys
 from datetime import datetime
-from functools import reduce
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as pta
-from freqtrade.strategy import (
-    IStrategy,
-    IntParameter,
-    DecimalParameter,
-    merge_informative_pair,
-)
+from freqtrade.strategy import IStrategy, stoploss_from_absolute
 from pandas import DataFrame
+
+# ── Import our exact indicator implementations ────────────────────────────────
+# Adds the repo root to sys.path so `backtest` package is importable regardless
+# of where freqtrade is invoked from.
+_repo_root = Path(__file__).resolve().parent.parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from backtest.indicators import (  # noqa: E402
+    atr,
+    ema,
+    macd,
+    rsi,
+    supertrend,
+    swing_levels,
+    vwap_daily,
+)
 
 
 class ConfluenceScalper(IStrategy):
 
-    # ── Strategy metadata ──────────────────────────────────────────────────────
+    # ── Metadata ───────────────────────────────────────────────────────────────
     INTERFACE_VERSION = 3
-    timeframe = "1m"
-    can_short = True                   # Binance Futures — long AND short
-    use_exit_signal = True
-    exit_profit_only = False
+    timeframe         = "1m"
+    can_short         = True        # Binance Futures — long AND short
+
+    use_exit_signal            = True
+    exit_profit_only           = False
     ignore_roi_if_entry_signal = False
 
-    # ── Risk / reward ──────────────────────────────────────────────────────────
-    # ROI is disabled — exits are handled by custom_stoploss (ATR-based)
-    minimal_roi = {"0": 100}           # effectively never exit by ROI alone
+    # ── ROI disabled — exits handled by custom_exit (ATR TP) and custom_stoploss
+    minimal_roi = {"0": 100}
 
-    stoploss = -0.05                   # max 5% fallback hard-stop (safety net)
-    trailing_stop = False              # we handle breakeven manually
+    # Fallback hard-stop (safety net if custom_stoploss returns None)
+    stoploss      = -0.10
+    trailing_stop = False
 
-    # ── Order settings (limit orders everywhere except SL) ────────────────────
+    # ── Order types — limit everywhere, stop-market for SL ───────────────────
     order_types = {
-        "entry": "limit",
-        "exit": "limit",
-        "stoploss": "market",          # stop-market = taker fee (0.04%)
-        "stoploss_on_exchange": True,  # place SL directly on Binance
+        "entry":                 "limit",
+        "exit":                  "limit",
+        "stoploss":              "market",       # taker fee 0.04%
+        "stoploss_on_exchange":  True,
     }
-    order_time_in_force = {
-        "entry": "GTC",
-        "exit": "GTC",
-    }
+    order_time_in_force = {"entry": "GTC", "exit": "GTC"}
 
-    # ── Optimisable hyperparameters ────────────────────────────────────────────
-    # Uncomment and run `freqtrade hyperopt` to search for better values.
+    # ── Strategy parameters (update with optimizer results) ───────────────────
+    ema_fast_len   = 20
+    ema_slow_len   = 50
+    st_atr_len     = 7
+    st_factor      = 3.0
+    rsi_len        = 14
+    rsi_long_lo    = 40
+    rsi_long_hi    = 65
+    rsi_short_lo   = 35
+    rsi_short_hi   = 60
+    macd_fast      = 12
+    macd_slow      = 26
+    macd_sig       = 9
+    vol_sma_len    = 20
+    vol_mult       = 1.2
+    swing_len      = 3
+    atr_len        = 14
+    tp_mult        = 1.0    # TP at 1× ATR  (closer = higher win rate)
+    sl_mult        = 1.5    # SL at 1.5× ATR (wider = more breathing room)
+    limit_offset   = 0.0002  # 0.02% inside close for maker fill probability
+    max_trade_bars = 30      # time stop: flatten if trade lives longer than this
 
-    # buy_ema_fast   = IntParameter(10, 30,   default=20,  space="buy",  load=True)
-    # buy_ema_slow   = IntParameter(30, 100,  default=50,  space="buy",  load=True)
-    # buy_rsi_lo     = IntParameter(30, 50,   default=40,  space="buy",  load=True)
-    # buy_rsi_hi     = IntParameter(55, 75,   default=65,  space="buy",  load=True)
-    # sell_rsi_lo    = IntParameter(25, 45,   default=35,  space="sell", load=True)
-    # sell_rsi_hi    = IntParameter(50, 65,   default=60,  space="sell", load=True)
-    # buy_vol_mult   = DecimalParameter(1.0, 2.5, default=1.2, space="buy", load=True)
-    # buy_tp_mult    = DecimalParameter(1.5, 4.0, default=2.0, space="buy", load=True)
-    # buy_sl_mult    = DecimalParameter(0.5, 2.0, default=1.0, space="buy", load=True)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Indicators
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # Fixed parameters (change here or enable hyperopt above)
-    ema_fast_len = 20
-    ema_slow_len = 50
-    st_factor    = 3.0
-    st_atr_len   = 7
-    rsi_len      = 14
-    rsi_long_lo  = 40
-    rsi_long_hi  = 65
-    rsi_short_lo = 35
-    rsi_short_hi = 60
-    macd_fast    = 12
-    macd_slow    = 26
-    macd_sig     = 9
-    vol_sma_len  = 20
-    vol_mult     = 1.2
-    atr_len      = 14
-    tp_mult      = 2.0
-    sl_mult      = 1.0
-    limit_offset = 0.0002              # 0.02% — entry limit inside close for maker fill
-    max_trade_bars = 30                # time stop
+    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        """
+        Computes all indicators using the same functions as the Python backtester.
+        Freqtrade's dataframe has integer index; we temporarily set DatetimeIndex
+        for VWAP and swing pivot calculations, then restore.
+        """
+        # Freqtrade provides a 'date' column; set as index for our functions
+        df = dataframe.set_index("date")
 
-    # ── Custom stoploss (ATR-based with breakeven trail) ───────────────────────
+        # ── Trend ─────────────────────────────────────────────────────────────
+        dataframe["ema_fast"] = ema(df["close"], self.ema_fast_len).values
+        dataframe["ema_slow"] = ema(df["close"], self.ema_slow_len).values
+
+        st_line, st_dir = supertrend(
+            df["high"], df["low"], df["close"],
+            period=self.st_atr_len, factor=self.st_factor,
+        )
+        dataframe["st_line"]  = st_line.values
+        dataframe["st_dir"]   = st_dir.values   # -1 = bullish, +1 = bearish
+
+        # ── VWAP ──────────────────────────────────────────────────────────────
+        dataframe["vwap"] = vwap_daily(df).values
+
+        # ── Market structure ───────────────────────────────────────────────────
+        sh1, sh2, sl1, sl2 = swing_levels(df["high"], df["low"], self.swing_len)
+        dataframe["sh1"] = sh1.values
+        dataframe["sh2"] = sh2.values
+        dataframe["sl1"] = sl1.values
+        dataframe["sl2"] = sl2.values
+
+        # ── Momentum ───────────────────────────────────────────────────────────
+        dataframe["rsi"] = rsi(df["close"], self.rsi_len).values
+
+        macd_line, signal_line, histogram = macd(
+            df["close"], self.macd_fast, self.macd_slow, self.macd_sig
+        )
+        dataframe["macd_line"] = macd_line.values
+        dataframe["macd_sig"]  = signal_line.values
+        dataframe["macd_hist"] = histogram.values
+
+        # ── Volume ─────────────────────────────────────────────────────────────
+        dataframe["vol_sma"] = df["volume"].rolling(self.vol_sma_len).mean().values
+
+        # ── ATR ────────────────────────────────────────────────────────────────
+        dataframe["atr"] = atr(df["high"], df["low"], df["close"], self.atr_len).values
+
+        return dataframe
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Entry signals
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        df = dataframe
+
+        # ── MACD momentum helpers ──────────────────────────────────────────────
+        macd_xover  = (df["macd_line"] > df["macd_sig"]) & (df["macd_line"].shift(1) <= df["macd_sig"].shift(1))
+        macd_xunder = (df["macd_line"] < df["macd_sig"]) & (df["macd_line"].shift(1) >= df["macd_sig"].shift(1))
+
+        macd_bull = macd_xover | (
+            (df["macd_line"] > df["macd_sig"]) &
+            (df["macd_hist"] > df["macd_hist"].shift(1)) &
+            (df["macd_hist"] > 0)
+        )
+        macd_bear = macd_xunder | (
+            (df["macd_line"] < df["macd_sig"]) &
+            (df["macd_hist"] < df["macd_hist"].shift(1)) &
+            (df["macd_hist"] < 0)
+        )
+
+        # ── Market structure helpers ───────────────────────────────────────────
+        struct_valid = df["sh1"].notna() & df["sh2"].notna() & df["sl1"].notna() & df["sl2"].notna()
+        bull_ms = struct_valid & (df["sh1"] > df["sh2"]) & (df["sl1"] > df["sl2"])
+        bear_ms = struct_valid & (df["sh1"] < df["sh2"]) & (df["sl1"] < df["sl2"])
+        ema_accel_bull = df["ema_fast"] > df["ema_fast"].shift(5)
+        ema_accel_bear = df["ema_fast"] < df["ema_fast"].shift(5)
+
+        vol_ok = df["volume"] > self.vol_mult * df["vol_sma"]
+
+        # ── Long ───────────────────────────────────────────────────────────────
+        long_cond = (
+            (df["ema_fast"] > df["ema_slow"])       &   # EMA: bullish structure
+            (df["st_dir"]   < 0)                    &   # Supertrend: bullish
+            (df["close"]    > df["vwap"])            &   # VWAP: above anchor
+            (bull_ms | ema_accel_bull)               &   # Market structure
+            (df["rsi"] > self.rsi_long_lo)           &   # RSI: not oversold
+            (df["rsi"] < self.rsi_long_hi)           &   # RSI: not overbought
+            macd_bull                                &   # MACD: momentum up
+            vol_ok                                   &   # Volume: real move
+            (df["volume"] > 0)
+        )
+        dataframe.loc[long_cond,  "enter_long"]  = 1
+        dataframe.loc[long_cond,  "enter_tag"]   = "Long"
+
+        # ── Short ──────────────────────────────────────────────────────────────
+        short_cond = (
+            (df["ema_fast"] < df["ema_slow"])       &
+            (df["st_dir"]   > 0)                    &
+            (df["close"]    < df["vwap"])            &
+            (bear_ms | ema_accel_bear)               &
+            (df["rsi"] > self.rsi_short_lo)          &
+            (df["rsi"] < self.rsi_short_hi)          &
+            macd_bear                                &
+            vol_ok                                   &
+            (df["volume"] > 0)
+        )
+        dataframe.loc[short_cond, "enter_short"] = 1
+        dataframe.loc[short_cond, "enter_tag"]   = "Short"
+
+        return dataframe
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Exit signals — handled via custom_exit and custom_stoploss
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe["exit_long"]  = 0
+        dataframe["exit_short"] = 0
+        return dataframe
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Custom entry price — limit inside spread for maker fill
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def custom_entry_price(
+        self, pair: str, trade, current_time: datetime,
+        proposed_rate: float, entry_tag: Optional[str], side: str, **kwargs,
+    ) -> float:
+        if side == "long":
+            return proposed_rate * (1.0 - self.limit_offset)
+        return proposed_rate * (1.0 + self.limit_offset)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Custom stoploss — ATR-based with breakeven trail
+    # ─────────────────────────────────────────────────────────────────────────
 
     def custom_stoploss(
-        self,
-        pair: str,
-        trade,
-        current_time: datetime,
-        current_rate: float,
-        current_profit: float,
-        after_fill: bool,
-        **kwargs,
+        self, pair: str, trade, current_time: datetime,
+        current_rate: float, current_profit: float, after_fill: bool, **kwargs,
     ) -> Optional[float]:
         """
-        Returns a dynamic stoploss relative to current_rate.
-        Implements:
-          1. ATR-based initial SL at entry
-          2. Breakeven trail once 1× SL-ATR profit is secured
+        Returns an ATR-based stoploss.
+        Once price moves 1× SL-ATR in our favour, trails to breakeven.
+        Uses stoploss_from_absolute() which correctly handles long/short sign.
         """
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if dataframe is None or len(dataframe) == 0:
             return None
 
-        last = dataframe.iloc[-1]
-        atr  = last.get("atr", None)
-        if atr is None or np.isnan(atr):
+        atr_val = dataframe.iloc[-1].get("atr", None)
+        if atr_val is None or np.isnan(float(atr_val)):
             return None
+        atr_val = float(atr_val)
 
-        entry_rate = trade.open_rate
-        sl_distance = self.sl_mult * atr      # price distance for SL
+        entry  = trade.open_rate
+        sl_dist = self.sl_mult * atr_val
 
         if trade.is_short:
-            sl_price = entry_rate + sl_distance
-            # Breakeven once 1× SL distance gained
-            if current_rate <= entry_rate - sl_distance:
-                sl_price = min(sl_price, entry_rate)
-            return (sl_price - current_rate) / current_rate  # negative value
+            sl_price = entry + sl_dist
+            # Breakeven: price has moved 1× SL distance in our favour
+            if current_rate <= entry - sl_dist:
+                sl_price = min(sl_price, entry)
         else:
-            sl_price = entry_rate - sl_distance
-            if current_rate >= entry_rate + sl_distance:
-                sl_price = max(sl_price, entry_rate)
-            return (sl_price - current_rate) / current_rate
+            sl_price = entry - sl_dist
+            if current_rate >= entry + sl_dist:
+                sl_price = max(sl_price, entry)
 
-    # ── Custom exit (TP + time stop) ───────────────────────────────────────────
+        return stoploss_from_absolute(sl_price, current_rate, is_short=trade.is_short)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Custom exit — take-profit limit + time stop
+    # ─────────────────────────────────────────────────────────────────────────
 
     def custom_exit(
-        self,
-        pair: str,
-        trade,
-        current_time: datetime,
-        current_rate: float,
-        current_profit: float,
-        **kwargs,
+        self, pair: str, trade, current_time: datetime,
+        current_rate: float, current_profit: float, **kwargs,
     ) -> Optional[str]:
-        """TP limit (2× ATR) and time-based exit."""
+        """
+        Closes at 1× ATR take-profit (limit order, 0% fee) or
+        flattens after max_trade_bars (market, 0.04% fee).
+        """
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if dataframe is None or len(dataframe) == 0:
             return None
 
-        last  = dataframe.iloc[-1]
-        atr   = last.get("atr", None)
-        if atr is None or np.isnan(atr):
+        atr_val = dataframe.iloc[-1].get("atr", None)
+        if atr_val is None or np.isnan(float(atr_val)):
             return None
+        atr_val = float(atr_val)
 
-        entry_rate  = trade.open_rate
-        tp_distance = self.tp_mult * atr
+        entry   = trade.open_rate
+        tp_dist = self.tp_mult * atr_val
 
-        # Take-profit hit
         if trade.is_short:
-            if current_rate <= entry_rate - tp_distance:
+            if current_rate <= entry - tp_dist:
                 return "TP"
         else:
-            if current_rate >= entry_rate + tp_distance:
+            if current_rate >= entry + tp_dist:
                 return "TP"
 
-        # Time stop — flatten after max_trade_bars candles
+        # Time stop — flatten if trade has been open too long
         bars_open = (current_time - trade.open_date_utc).total_seconds() / 60
         if bars_open >= self.max_trade_bars:
             return "Time Stop"
 
         return None
-
-    # ── Custom entry price (limit offset for maker fill) ──────────────────────
-
-    def custom_entry_price(
-        self,
-        pair: str,
-        trade,
-        current_time: datetime,
-        proposed_rate: float,
-        entry_tag: Optional[str],
-        side: str,
-        **kwargs,
-    ) -> float:
-        """Place limit slightly inside the spread to improve maker probability."""
-        if side == "long":
-            return proposed_rate * (1 - self.limit_offset)
-        else:
-            return proposed_rate * (1 + self.limit_offset)
-
-    # ── Populate indicators ────────────────────────────────────────────────────
-
-    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Trend — EMA
-        dataframe["ema_fast"] = pta.ema(dataframe["close"], length=self.ema_fast_len)
-        dataframe["ema_slow"] = pta.ema(dataframe["close"], length=self.ema_slow_len)
-
-        # Trend — Supertrend
-        st = pta.supertrend(
-            dataframe["high"],
-            dataframe["low"],
-            dataframe["close"],
-            length=self.st_atr_len,
-            multiplier=self.st_factor,
-        )
-        # pandas_ta Supertrend returns columns named SUPERTd_<len>_<mult>
-        st_dir_col = [c for c in st.columns if c.startswith("SUPERTd")][0]
-        st_val_col = [c for c in st.columns if c.startswith("SUPERT_")][0]
-        dataframe["st_direction"] = st[st_dir_col]  # 1 = bearish, -1 = bullish
-        dataframe["st_value"]     = st[st_val_col]
-
-        # Trend — VWAP (session-anchored)
-        dataframe["vwap"] = pta.vwap(
-            dataframe["high"],
-            dataframe["low"],
-            dataframe["close"],
-            dataframe["volume"],
-        )
-
-        # Momentum — RSI
-        dataframe["rsi"] = pta.rsi(dataframe["close"], length=self.rsi_len)
-
-        # Momentum — MACD
-        macd = pta.macd(dataframe["close"],
-                        fast=self.macd_fast,
-                        slow=self.macd_slow,
-                        signal=self.macd_sig)
-        dataframe["macd"]        = macd[f"MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_sig}"]
-        dataframe["macd_signal"] = macd[f"MACDs_{self.macd_fast}_{self.macd_slow}_{self.macd_sig}"]
-        dataframe["macd_hist"]   = macd[f"MACDh_{self.macd_fast}_{self.macd_slow}_{self.macd_sig}"]
-
-        # Volume filter
-        dataframe["vol_sma"] = pta.sma(dataframe["volume"], length=self.vol_sma_len)
-        dataframe["vol_ok"]  = dataframe["volume"] > self.vol_mult * dataframe["vol_sma"]
-
-        # ATR for dynamic SL/TP
-        dataframe["atr"] = pta.atr(
-            dataframe["high"], dataframe["low"], dataframe["close"],
-            length=self.atr_len
-        )
-
-        # Market Structure — rolling swing highs/lows (3-bar pivots)
-        n = 3
-        dataframe["swing_high"] = dataframe["high"].rolling(2 * n + 1, center=True).max()
-        dataframe["swing_low"]  = dataframe["low"].rolling(2 * n + 1, center=True).min()
-        dataframe["is_swing_high"] = dataframe["high"] == dataframe["swing_high"]
-        dataframe["is_swing_low"]  = dataframe["low"]  == dataframe["swing_low"]
-
-        # Track last two confirmed swing highs/lows
-        sh_vals = dataframe.loc[dataframe["is_swing_high"], "high"].reindex(dataframe.index).ffill()
-        sh_prev = sh_vals.shift(1)
-        sl_vals = dataframe.loc[dataframe["is_swing_low"], "low"].reindex(dataframe.index).ffill()
-        sl_prev = sl_vals.shift(1)
-
-        dataframe["bull_ms"] = (sh_vals > sh_prev) & (sl_vals > sl_prev)
-        dataframe["bear_ms"] = (sh_vals < sh_prev) & (sl_vals < sl_prev)
-
-        return dataframe
-
-    # ── Entry signals ──────────────────────────────────────────────────────────
-
-    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # MACD momentum helpers
-        macd_bull = (
-            (dataframe["macd"] > dataframe["macd_signal"]) &
-            (dataframe["macd_hist"] > dataframe["macd_hist"].shift(1)) &
-            (dataframe["macd_hist"] > 0)
-        ) | (
-            (dataframe["macd"] > dataframe["macd_signal"]) &
-            (dataframe["macd"].shift(1) <= dataframe["macd_signal"].shift(1))  # crossover
-        )
-
-        macd_bear = (
-            (dataframe["macd"] < dataframe["macd_signal"]) &
-            (dataframe["macd_hist"] < dataframe["macd_hist"].shift(1)) &
-            (dataframe["macd_hist"] < 0)
-        ) | (
-            (dataframe["macd"] < dataframe["macd_signal"]) &
-            (dataframe["macd"].shift(1) >= dataframe["macd_signal"].shift(1))  # crossunder
-        )
-
-        ema_bull_accel = dataframe["ema_fast"] > dataframe["ema_fast"].shift(5)
-        ema_bear_accel = dataframe["ema_fast"] < dataframe["ema_fast"].shift(5)
-
-        # ── Long conditions ──
-        dataframe.loc[
-            (dataframe["ema_fast"] > dataframe["ema_slow"])         &  # EMA trend up
-            (dataframe["st_direction"] == -1)                        &  # Supertrend bullish
-            (dataframe["close"] > dataframe["vwap"])                 &  # Above VWAP
-            (dataframe["bull_ms"] | ema_bull_accel)                  &  # Structure / momentum
-            (dataframe["rsi"] > self.rsi_long_lo)                    &
-            (dataframe["rsi"] < self.rsi_long_hi)                    &
-            macd_bull                                                 &  # MACD confirms
-            dataframe["vol_ok"]                                       &  # Volume confirms
-            (dataframe["volume"] > 0),
-            "enter_long",
-        ] = 1
-
-        dataframe.loc[
-            (dataframe["ema_fast"] > dataframe["ema_slow"])         &
-            (dataframe["st_direction"] == -1)                        &
-            (dataframe["close"] > dataframe["vwap"])                 &
-            (dataframe["bull_ms"] | ema_bull_accel)                  &
-            (dataframe["rsi"] > self.rsi_long_lo)                    &
-            (dataframe["rsi"] < self.rsi_long_hi)                    &
-            macd_bull                                                 &
-            dataframe["vol_ok"],
-            "enter_tag",
-        ] = "Long"
-
-        # ── Short conditions ──
-        dataframe.loc[
-            (dataframe["ema_fast"] < dataframe["ema_slow"])         &  # EMA trend down
-            (dataframe["st_direction"] == 1)                         &  # Supertrend bearish
-            (dataframe["close"] < dataframe["vwap"])                 &  # Below VWAP
-            (dataframe["bear_ms"] | ema_bear_accel)                  &  # Structure / momentum
-            (dataframe["rsi"] > self.rsi_short_lo)                   &
-            (dataframe["rsi"] < self.rsi_short_hi)                   &
-            macd_bear                                                 &
-            dataframe["vol_ok"]                                       &
-            (dataframe["volume"] > 0),
-            "enter_short",
-        ] = 1
-
-        dataframe.loc[
-            (dataframe["ema_fast"] < dataframe["ema_slow"])         &
-            (dataframe["st_direction"] == 1)                         &
-            (dataframe["close"] < dataframe["vwap"])                 &
-            (dataframe["bear_ms"] | ema_bear_accel)                  &
-            (dataframe["rsi"] > self.rsi_short_lo)                   &
-            (dataframe["rsi"] < self.rsi_short_hi)                   &
-            macd_bear                                                 &
-            dataframe["vol_ok"],
-            "enter_tag",
-        ] = "Short"
-
-        return dataframe
-
-    # ── Exit signals (main exit via custom_stoploss / custom_exit) ────────────
-
-    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # No indicator-based exits — handled in custom_exit and custom_stoploss
-        dataframe["exit_long"]  = 0
-        dataframe["exit_short"] = 0
-        return dataframe
