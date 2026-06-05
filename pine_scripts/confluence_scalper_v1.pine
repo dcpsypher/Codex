@@ -1,0 +1,348 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// CONFLUENCE SCALPER v1 — Binance USDC Futures
+// ══════════════════════════════════════════════════════════════════════════════
+// Designed for: BTC/USDC, ETH/USDC, SOL/USDC — 1m timeframe
+// Capital: $20 starting | Leverage: 10–30x
+// Fee model: Limit entries/TP = 0% maker | Stop-market SL = 0.04% taker
+//
+// Entry stack (ALL must confirm):
+//   Trend       — EMA 20 > EMA 50, Supertrend direction
+//   VWAP        — Price above/below VWAP (institutional bias)
+//   Structure   — Higher highs+lows (bull) / Lower highs+lows (bear)
+//   Momentum    — RSI in healthy zone, MACD histogram direction
+//   Volume      — Volume > threshold × Volume SMA
+//
+// Exits:
+//   Take-profit — Limit order at 2× ATR (maker, 0% fee)
+//   Stop-loss   — Stop-market at 1× ATR (taker, 0.04% fee)
+//   Breakeven   — SL moved to entry after 1× ATR profit secured
+//   Time stop   — Flat after N bars regardless
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+strategy(
+    title               = "Confluence Scalper v1 — Binance USDC Futures",
+    shorttitle          = "CS_v1",
+    overlay             = true,
+    initial_capital     = 20,
+    default_qty_type    = strategy.percent_of_equity,
+    default_qty_value   = 100,
+    commission_type     = strategy.commission.percent,
+    commission_value    = 0.04,
+    slippage            = 1,
+    calc_on_order_fills = true,
+    pyramiding          = 0,
+    max_bars_back       = 500
+)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+
+// — Trend —
+i_emaFast    = input.int(20,    "EMA Fast Length",          group = "Trend",            minval = 5)
+i_emaSlow    = input.int(50,    "EMA Slow Length",          group = "Trend",            minval = 10)
+i_stFactor   = input.float(3.0, "Supertrend Factor",        group = "Trend",            step = 0.1, minval = 1.0)
+i_stAtrLen   = input.int(7,     "Supertrend ATR Length",    group = "Trend",            minval = 1)
+
+// — Momentum —
+i_rsiLen     = input.int(14,    "RSI Length",               group = "Momentum",         minval = 2)
+i_rsiLongLo  = input.int(40,    "RSI Long Min",             group = "Momentum",         tooltip = "Don't enter long below this RSI")
+i_rsiLongHi  = input.int(65,    "RSI Long Max",             group = "Momentum",         tooltip = "Don't enter long above this RSI (avoids overbought)")
+i_rsiShortLo = input.int(35,    "RSI Short Min",            group = "Momentum",         tooltip = "Don't enter short below this RSI (avoids oversold)")
+i_rsiShortHi = input.int(60,    "RSI Short Max",            group = "Momentum",         tooltip = "Don't enter short above this RSI")
+i_macdFast   = input.int(12,    "MACD Fast",                group = "Momentum")
+i_macdSlow   = input.int(26,    "MACD Slow",                group = "Momentum")
+i_macdSig    = input.int(9,     "MACD Signal",              group = "Momentum")
+
+// — Volume —
+i_volLen     = input.int(20,    "Volume SMA Length",        group = "Volume")
+i_volMult    = input.float(1.2, "Volume Multiplier",        group = "Volume",           step = 0.1, tooltip = "Volume must exceed this × SMA to confirm signal")
+
+// — Market Structure —
+i_swingLen   = input.int(3,     "Swing Pivot Bars (L & R)", group = "Market Structure", minval = 1, tooltip = "Bars left+right to confirm a swing pivot")
+
+// — Risk Management —
+i_atrLen     = input.int(14,    "ATR Length",               group = "Risk Management")
+i_tpMult     = input.float(2.0, "TP ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Take-profit distance = this × ATR")
+i_slMult     = input.float(1.0, "SL ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Stop-loss distance = this × ATR")
+i_limitOff   = input.float(0.02,"Limit Entry Offset %",     group = "Risk Management",  step = 0.01, tooltip = "Place limit this % inside close for maker fill probability")
+i_maxBars    = input.int(30,    "Max Bars in Trade (Time Stop)", group = "Risk Management", minval = 1)
+i_leverage   = input.int(10,    "Display Leverage",         group = "Risk Management",  tooltip = "Informational only — set actual leverage on Binance")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// INDICATOR CALCULATIONS
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Trend — EMA ribbon
+emaFast = ta.ema(close, i_emaFast)
+emaSlow = ta.ema(close, i_emaSlow)
+emaBull = emaFast > emaSlow
+emaBear = emaFast < emaSlow
+
+// Trend — Supertrend  (direction: -1 = bullish, +1 = bearish)
+[stValue, stDir] = ta.supertrend(i_stFactor, i_stAtrLen)
+stBull = stDir < 0
+stBear = stDir > 0
+
+// Trend — VWAP (resets each trading session)
+vwapVal = ta.vwap(hlc3)
+
+// Momentum — RSI
+rsi = ta.rsi(close, i_rsiLen)
+
+// Momentum — MACD
+[macdLine, sigLine, histLine] = ta.macd(close, i_macdFast, i_macdSlow, i_macdSig)
+
+// Volume confirmation
+volSma = ta.sma(volume, i_volLen)
+volOk  = volume > i_volMult * volSma
+
+// Market Structure — swing pivot tracking
+swH = ta.pivothigh(high, i_swingLen, i_swingLen)
+swL = ta.pivotlow(low,   i_swingLen, i_swingLen)
+
+var float sh1 = na
+var float sh2 = na
+var float sl1 = na
+var float sl2 = na
+
+if not na(swH)
+    sh2 := sh1
+    sh1 := swH
+
+if not na(swL)
+    sl2 := sl1
+    sl1 := swL
+
+// Higher highs AND higher lows  → bullish structure
+// Lower highs AND lower lows    → bearish structure
+bullMS = not na(sh1) and not na(sh2) and not na(sl1) and not na(sl2) and sh1 > sh2 and sl1 > sl2
+bearMS = not na(sh1) and not na(sh2) and not na(sl1) and not na(sl2) and sh1 < sh2 and sl1 < sl2
+
+// ATR (used for dynamic SL/TP)
+atr = ta.atr(i_atrLen)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SIGNAL CONDITIONS
+// ──────────────────────────────────────────────────────────────────────────────
+
+// MACD momentum: fresh histogram cross OR histogram accelerating in direction
+macdBullish = ta.crossover(macdLine, sigLine) or (macdLine > sigLine and histLine > histLine[1] and histLine > 0)
+macdBearish = ta.crossunder(macdLine, sigLine) or (macdLine < sigLine and histLine < histLine[1] and histLine < 0)
+
+// — Long: all 6 layers agree —
+longSignal = emaBull                                  // EMA trend: fast above slow
+          and stBull                                  // Supertrend: bullish
+          and close > vwapVal                         // VWAP: price above institutional anchor
+          and (bullMS or emaFast > emaFast[5])        // Structure: HH/HL or EMA accelerating
+          and rsi > i_rsiLongLo and rsi < i_rsiLongHi // RSI: healthy momentum, not overbought
+          and macdBullish                             // MACD: momentum confirms direction
+          and volOk                                   // Volume: real participation
+          and strategy.position_size == 0             // No open position
+
+// — Short: all 6 layers agree —
+shortSignal = emaBear
+           and stBear
+           and close < vwapVal
+           and (bearMS or emaFast < emaFast[5])
+           and rsi > i_rsiShortLo and rsi < i_rsiShortHi
+           and macdBearish
+           and volOk
+           and strategy.position_size == 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ENTRY ORDERS — LIMIT (MAKER = 0% FEE ON BINANCE USDC PAIRS)
+// ──────────────────────────────────────────────────────────────────────────────
+
+longLimitPx  = close * (1 - i_limitOff / 100)
+shortLimitPx = close * (1 + i_limitOff / 100)
+
+if longSignal
+    strategy.cancel("Short")                // cancel any pending opposite order
+    strategy.entry("Long", strategy.long,  limit = longLimitPx, comment = "Long")
+
+if shortSignal
+    strategy.cancel("Long")
+    strategy.entry("Short", strategy.short, limit = shortLimitPx, comment = "Short")
+
+// Cancel pending order if conditions flip before fill
+if strategy.position_size == 0
+    if not longSignal
+        strategy.cancel("Long")
+    if not shortSignal
+        strategy.cancel("Short")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EXIT ORDERS — TP LIMIT (MAKER 0%) + SL STOP-MARKET (TAKER 0.04%)
+// ──────────────────────────────────────────────────────────────────────────────
+
+var float lTp   = na
+var float lSl   = na
+var float sTp   = na
+var float sSl   = na
+var int   barsIn = 0
+
+// Bars-in-trade counter
+if strategy.position_size != 0
+    barsIn += 1
+else
+    barsIn := 0
+
+// Set TP/SL the bar that position opens (limit just filled)
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    lTp := strategy.position_avg_price + i_tpMult * atr
+    lSl := strategy.position_avg_price - i_slMult * atr
+    strategy.exit("Long Exit", from_entry = "Long",
+         limit        = lTp,
+         stop         = lSl,
+         comment_profit = "Long TP",
+         comment_loss   = "Long SL")
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    sTp := strategy.position_avg_price - i_tpMult * atr
+    sSl := strategy.position_avg_price + i_slMult * atr
+    strategy.exit("Short Exit", from_entry = "Short",
+         limit        = sTp,
+         stop         = sSl,
+         comment_profit = "Short TP",
+         comment_loss   = "Short SL")
+
+// Breakeven trail — after price moves 1× SL-ATR in favor, lock in entry as SL
+if strategy.position_size > 0 and not na(lSl)
+    entryPx = strategy.position_avg_price
+    if high >= entryPx + i_slMult * atr and lSl < entryPx
+        lSl := entryPx
+        strategy.exit("Long Exit", from_entry = "Long",
+             limit        = lTp,
+             stop         = lSl,
+             comment_profit = "Long TP",
+             comment_loss   = "Long BE")
+
+if strategy.position_size < 0 and not na(sSl)
+    entryPx = strategy.position_avg_price
+    if low <= entryPx - i_slMult * atr and sSl > entryPx
+        sSl := entryPx
+        strategy.exit("Short Exit", from_entry = "Short",
+             limit        = sTp,
+             stop         = sSl,
+             comment_profit = "Short TP",
+             comment_loss   = "Short BE")
+
+// Time stop — flatten if trade hasn't resolved within maxBars candles
+if strategy.position_size != 0 and barsIn >= i_maxBars
+    strategy.close_all(comment = "Time Stop")
+    strategy.cancel_all()
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VISUAL — CHART OVERLAYS
+// ──────────────────────────────────────────────────────────────────────────────
+
+// EMA ribbon with fill
+p_emaF = plot(emaFast, "EMA 20", color = color.new(color.blue, 15), linewidth = 1)
+p_emaS = plot(emaSlow, "EMA 50", color = color.new(color.orange, 10), linewidth = 2)
+fill(p_emaF, p_emaS,
+     color = emaBull ? color.new(color.green, 90) : color.new(color.red, 90))
+
+// VWAP
+plot(vwapVal, "VWAP", color = color.new(color.purple, 25), linewidth = 1, style = plot.style_circles)
+
+// Supertrend (color-coded)
+stClr = stBull ? color.new(color.lime, 25) : color.new(color.red, 25)
+plot(stValue, "Supertrend", color = stClr, linewidth = 2, style = plot.style_linebr)
+
+// TP / SL level lines (visible only while in trade)
+plot(strategy.position_size > 0 ? lTp : na, "Long TP",  color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size > 0 ? lSl : na, "Long SL",  color = color.new(color.red, 0),   linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size < 0 ? sTp : na, "Short TP", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size < 0 ? sSl : na, "Short SL", color = color.new(color.red, 0),   linewidth = 1, style = plot.style_linebr)
+
+// Entry signal arrows
+plotshape(longSignal,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),   size = size.small)
+plotshape(shortSignal, "Short Entry", shape.triangledown, location.abovebar, color.new(color.red, 0),    size = size.small)
+
+// Trade background shading
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 94)
+      : strategy.position_size < 0 ? color.new(color.red,   94)
+      : na,
+      title = "Position Background")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD TABLE  (top-right corner)
+// ──────────────────────────────────────────────────────────────────────────────
+
+var table dash = table.new(
+     position     = position.top_right,
+     columns      = 2,
+     rows         = 12,
+     bgcolor      = color.new(color.black, 70),
+     border_color = color.new(color.gray, 50),
+     border_width = 1,
+     frame_color  = color.new(color.gray, 30),
+     frame_width  = 1)
+
+if barstate.islast
+    // ── helpers ──
+    ct = strategy.closedtrades
+    winPct   = ct > 0 ? strategy.wintrades / ct * 100 : 0.0
+    lossAmt  = math.abs(strategy.grossloss)
+    pf       = strategy.grossprofit > 0 and lossAmt > 0 ? strategy.grossprofit / lossAmt : 0.0
+    pnlColor = strategy.netprofit >= 0 ? color.lime : color.red
+    wrColor  = winPct >= 60 ? color.lime : winPct >= 45 ? color.yellow : color.red
+    pfColor  = pf >= 1.5 ? color.lime : pf >= 1.0 ? color.yellow : color.red
+
+    trendTxt = emaBull ? "BULLISH" : emaBear ? "BEARISH" : "NEUTRAL"
+    trendClr = emaBull ? color.lime : emaBear ? color.red : color.gray
+    stTxt    = stBull  ? "BULLISH" : "BEARISH"
+    stClr2   = stBull  ? color.lime : color.red
+
+    // ── header ──
+    table.cell(dash, 0, 0, "CONFLUENCE SCALPER v1",
+         text_color = color.white, text_size = size.small,
+         bgcolor = color.new(color.navy, 40))
+    table.cell(dash, 1, 0, "Binance USDC Futures",
+         text_color = color.yellow, text_size = size.tiny,
+         bgcolor = color.new(color.navy, 40))
+
+    // ── performance ──
+    table.cell(dash, 0, 1, "Net P&L",       text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 1, "$" + str.tostring(math.round(strategy.netprofit, 2)),
+         text_color = pnlColor, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "Equity",        text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 2, "$" + str.tostring(math.round(strategy.equity, 2)),
+         text_color = color.white, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Win Rate",      text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(math.round(winPct, 1)) + "%",
+         text_color = wrColor, text_size = size.tiny)
+
+    table.cell(dash, 0, 4, "Profit Factor", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(math.round(pf, 2)),
+         text_color = pfColor, text_size = size.tiny)
+
+    table.cell(dash, 0, 5, "Trades",        text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(ct), text_color = color.white, text_size = size.tiny)
+
+    // ── config ──
+    table.cell(dash, 0, 6, "Leverage",      text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(i_leverage) + "x",
+         text_color = color.white, text_size = size.tiny)
+
+    table.cell(dash, 0, 7, "Maker Fee",     text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 7, "0.00% (Limit)", text_color = color.lime,   text_size = size.tiny)
+
+    table.cell(dash, 0, 8, "Taker Fee",     text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 8, "0.04% (SL)",    text_color = color.yellow, text_size = size.tiny)
+
+    // ── live signal state ──
+    table.cell(dash, 0, 9,  "EMA Trend",    text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 9,  trendTxt,       text_color = trendClr,     text_size = size.tiny)
+
+    table.cell(dash, 0, 10, "Supertrend",   text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 10, stTxt,          text_color = stClr2,       text_size = size.tiny)
+
+    rsiTxt = "RSI " + str.tostring(math.round(rsi, 1))
+    rsiClr = rsi > 70 ? color.red : rsi < 30 ? color.red : color.white
+    table.cell(dash, 0, 11, "RSI",          text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 11, rsiTxt,         text_color = rsiClr,       text_size = size.tiny)
