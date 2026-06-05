@@ -64,11 +64,15 @@ i_swingLen   = input.int(3,     "Swing Pivot Bars (L & R)", group = "Market Stru
 
 // — Risk Management —
 i_atrLen     = input.int(14,    "ATR Length",               group = "Risk Management")
-i_tpMult     = input.float(2.0, "TP ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Take-profit distance = this × ATR")
-i_slMult     = input.float(1.0, "SL ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Stop-loss distance = this × ATR")
+i_tpMult     = input.float(1.0, "TP ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Take-profit distance = this × ATR. For HIGH win rate keep TP <= SL.")
+i_slMult     = input.float(1.5, "SL ATR Multiplier",        group = "Risk Management",  step = 0.1, tooltip = "Stop-loss distance = this × ATR. Wider SL than TP => higher win rate.")
 i_limitOff   = input.float(0.02,"Limit Entry Offset %",     group = "Risk Management",  step = 0.01, tooltip = "Place limit this % inside close for maker fill probability")
 i_maxBars    = input.int(30,    "Max Bars in Trade (Time Stop)", group = "Risk Management", minval = 1)
 i_leverage   = input.int(10,    "Display Leverage",         group = "Risk Management",  tooltip = "Informational only — set actual leverage on Binance")
+
+// — Breakeven Trail —
+i_beEnable   = input.bool(false,"Enable Breakeven Trail",   group = "Breakeven", tooltip = "OFF by default. When ON, SL moves to entry only AFTER price reaches the trigger fraction of TP — so it no longer strangles winners early.")
+i_beTrigger  = input.float(0.7, "BE Trigger (fraction of TP)", group = "Breakeven", step = 0.05, minval = 0.1, maxval = 1.0, tooltip = "Move SL to breakeven once price travels this fraction of the way to TP.")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // INDICATOR CALCULATIONS
@@ -208,10 +212,13 @@ if strategy.position_size < 0 and strategy.position_size[1] == 0
          comment_profit = "Short TP",
          comment_loss   = "Short SL")
 
-// Breakeven trail — after price moves 1× SL-ATR in favor, lock in entry as SL
-if strategy.position_size > 0 and not na(lSl)
-    entryPx = strategy.position_avg_price
-    if high >= entryPx + i_slMult * atr and lSl < entryPx
+// Breakeven trail (OPT-IN) — moves SL to entry only after price has traveled
+// i_beTrigger fraction of the way to TP, so it no longer converts early-momentum
+// winners into breakeven scratches. Disabled by default.
+if i_beEnable and strategy.position_size > 0 and not na(lSl) and not na(lTp)
+    entryPx  = strategy.position_avg_price
+    beLevel  = entryPx + i_beTrigger * (lTp - entryPx)
+    if high >= beLevel and lSl < entryPx
         lSl := entryPx
         strategy.exit("Long Exit", from_entry = "Long",
              limit        = lTp,
@@ -219,9 +226,10 @@ if strategy.position_size > 0 and not na(lSl)
              comment_profit = "Long TP",
              comment_loss   = "Long BE")
 
-if strategy.position_size < 0 and not na(sSl)
-    entryPx = strategy.position_avg_price
-    if low <= entryPx - i_slMult * atr and sSl > entryPx
+if i_beEnable and strategy.position_size < 0 and not na(sSl) and not na(sTp)
+    entryPx  = strategy.position_avg_price
+    beLevel  = entryPx - i_beTrigger * (entryPx - sTp)
+    if low <= beLevel and sSl > entryPx
         sSl := entryPx
         strategy.exit("Short Exit", from_entry = "Short",
              limit        = sTp,
