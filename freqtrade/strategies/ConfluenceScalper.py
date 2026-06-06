@@ -77,14 +77,15 @@ class ConfluenceScalper(IStrategy):
     order_time_in_force = {"entry": "GTC", "exit": "GTC"}
 
     # ── Strategy parameters (update with optimizer results) ───────────────────
-    ema_fast_len   = 20
-    ema_slow_len   = 50
+    ema_fast_len   = 9
+    ema_slow_len   = 21
     st_atr_len     = 7
     st_factor      = 3.0
+    breakout_len   = 20      # Donchian lookback — break prior 20-bar range
     rsi_len        = 14
     rsi_long_lo    = 40
-    rsi_long_hi    = 65
-    rsi_short_lo   = 35
+    rsi_long_hi    = 75      # don't buy breakouts above this RSI (too extended)
+    rsi_short_lo   = 25      # don't sell breakouts below this RSI (too extended)
     rsi_short_hi   = 60
     macd_fast      = 12
     macd_slow      = 26
@@ -93,11 +94,10 @@ class ConfluenceScalper(IStrategy):
     vol_mult       = 1.2
     swing_len      = 3
     atr_len        = 14
-    tp_mult        = 1.5    # TP at 1.5× ATR — 5m moves are larger; 1.5:1 R:R
-    sl_mult        = 1.0    # SL at 1× ATR  — tight since entry is at VWAP support
+    tp_mult        = 1.5    # TP at 1.5× ATR — ride breakout momentum
+    sl_mult        = 1.0    # SL at 1× ATR  — tight stop below breakout level
     limit_offset   = 0.0002  # 0.02% inside close for maker fill probability
     max_trade_bars = 12      # 12 × 5m = 60-minute time stop
-    vwap_touch_pct = 0.003   # 0.3% proximity band around VWAP for bounce/rejection
 
     # ─────────────────────────────────────────────────────────────────────────
     # Indicators
@@ -159,51 +159,33 @@ class ConfluenceScalper(IStrategy):
         df = dataframe
         vol_ok = df["volume"] > self.vol_mult * df["vol_sma"]
 
-        # ── VWAP bounce (long) ─────────────────────────────────────────────────
-        # Wick dipped within vwap_touch_pct above VWAP, candle closed above VWAP
-        # as a bullish bar — pullback-to-anchor demand-rejection entry.
-        vwap_touch_long  = df["low"]  <= df["vwap"] * (1.0 + self.vwap_touch_pct)
-        vwap_bounce_long = (
-            vwap_touch_long
-            & (df["close"] > df["vwap"])
-            & (df["close"] > df["open"])
-        )
-
-        # ── VWAP rejection (short) ─────────────────────────────────────────────
-        vwap_touch_short  = df["high"] >= df["vwap"] * (1.0 - self.vwap_touch_pct)
-        vwap_reject_short = (
-            vwap_touch_short
-            & (df["close"] < df["vwap"])
-            & (df["close"] < df["open"])
-        )
+        # ── Donchian breakout trigger (prior-bar range, no lookahead) ──────────
+        prior_high = df["high"].shift(1).rolling(self.breakout_len).max()
+        prior_low  = df["low"].shift(1).rolling(self.breakout_len).min()
+        breakout_long  = df["close"] > prior_high
+        breakout_short = df["close"] < prior_low
 
         # ── Long ───────────────────────────────────────────────────────────────
         long_cond = (
-            (df["ema_fast"] > df["ema_slow"])    &   # uptrend structure
-            (df["st_dir"]   < 0)                 &   # Supertrend bullish
-            vwap_bounce_long                     &   # VWAP bounce trigger
-            (df["rsi"] > self.rsi_long_lo)       &   # RSI not oversold
-            (df["rsi"] < self.rsi_long_hi)       &   # RSI not overbought
-            (df["macd_line"] > df["macd_sig"])   &   # MACD net bullish
+            (df["ema_fast"] > df["ema_slow"])    &   # fast-EMA uptrend
+            breakout_long                        &   # break prior 20-bar high
+            (df["rsi"] < self.rsi_long_hi)       &   # not too extended
             vol_ok                               &   # volume confirmed
             (df["volume"] > 0)
         )
         dataframe.loc[long_cond,  "enter_long"]  = 1
-        dataframe.loc[long_cond,  "enter_tag"]   = "VWAPBounce"
+        dataframe.loc[long_cond,  "enter_tag"]   = "Breakout"
 
         # ── Short ──────────────────────────────────────────────────────────────
         short_cond = (
-            (df["ema_fast"] < df["ema_slow"])    &
-            (df["st_dir"]   > 0)                 &
-            vwap_reject_short                    &
-            (df["rsi"] > self.rsi_short_lo)      &
-            (df["rsi"] < self.rsi_short_hi)      &
-            (df["macd_line"] < df["macd_sig"])   &
-            vol_ok                               &
+            (df["ema_fast"] < df["ema_slow"])    &   # fast-EMA downtrend
+            breakout_short                       &   # break prior 20-bar low
+            (df["rsi"] > self.rsi_short_lo)      &   # not too extended
+            vol_ok                               &   # volume confirmed
             (df["volume"] > 0)
         )
         dataframe.loc[short_cond, "enter_short"] = 1
-        dataframe.loc[short_cond, "enter_tag"]   = "VWAPReject"
+        dataframe.loc[short_cond, "enter_tag"]   = "Breakdown"
 
         return dataframe
 

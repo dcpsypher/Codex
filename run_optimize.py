@@ -69,11 +69,11 @@ def main() -> None:
     best = all_results[0]
     console.print("\n[bold green]✓ Best config to plug into Pine Script / DEFAULT_PARAMS:[/bold green]")
     console.print(
-        f"  TP mult        = [cyan]{best['tp_mult']}[/cyan]\n"
-        f"  SL mult        = [cyan]{best['sl_mult']}[/cyan]\n"
-        f"  RSI Long range = [cyan]{best['rsi_long_lo']} – {best['rsi_long_hi']}[/cyan]\n"
-        f"  Vol mult       = [cyan]{best['vol_mult']}[/cyan]\n"
-        f"  VWAP touch %   = [cyan]{best.get('vwap_touch_pct', 0.003):.3f}[/cyan]\n"
+        f"  TP mult       = [cyan]{best['tp_mult']}[/cyan]\n"
+        f"  SL mult       = [cyan]{best['sl_mult']}[/cyan]\n"
+        f"  Breakout len  = [cyan]{best['breakout_len']}[/cyan]\n"
+        f"  RSI Long cap  = [cyan]{best['rsi_long_hi']}[/cyan]\n"
+        f"  Vol mult      = [cyan]{best['vol_mult']}[/cyan]\n"
         f"  (All other params unchanged from defaults)\n"
     )
 

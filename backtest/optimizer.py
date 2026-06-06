@@ -32,12 +32,11 @@ console = Console()
 # ─────────────────────────────────────────────────────────────────────────────
 
 PARAM_GRID = {
-    "tp_mult":         [1.0, 1.5, 2.0],
-    "sl_mult":         [0.8, 1.0, 1.2],
-    "rsi_long_lo":     [35, 40, 45],
-    "rsi_long_hi":     [60, 65, 70],
-    "vol_mult":        [1.0, 1.2, 1.5],
-    "vwap_touch_pct":  [0.002, 0.003, 0.005],
+    "tp_mult":       [1.5, 2.0, 2.5],
+    "sl_mult":       [0.8, 1.0, 1.2],
+    "breakout_len":  [10, 20, 30],
+    "rsi_long_hi":   [70, 75, 80],
+    "vol_mult":      [1.0, 1.2, 1.5],
 }
 
 # Minimum thresholds — both in-sample AND out-of-sample must pass

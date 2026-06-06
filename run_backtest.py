@@ -28,16 +28,18 @@ console = Console()
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_PARAMS = {
-    # ── Trend ──────────────────────────────────────────────────────────────
-    "ema_fast":        20,
-    "ema_slow":        50,
+    # ── Trend (fast EMAs for breakout responsiveness) ──────────────────────
+    "ema_fast":        9,
+    "ema_slow":        21,
     "st_factor":       3.0,
     "st_atr_len":      7,
-    # ── Momentum ───────────────────────────────────────────────────────────
+    # ── Breakout entry ─────────────────────────────────────────────────────
+    "breakout_len":    20,      # Donchian lookback — break prior 20-bar range
+    # ── Momentum (RSI used only as an exhaustion guard now) ────────────────
     "rsi_len":         14,
     "rsi_long_lo":     40,
-    "rsi_long_hi":     65,
-    "rsi_short_lo":    35,
+    "rsi_long_hi":     75,      # don't buy breakouts above this RSI (too extended)
+    "rsi_short_lo":    25,      # don't sell breakouts below this RSI (too extended)
     "rsi_short_hi":    60,
     "macd_fast":       12,
     "macd_slow":       26,
@@ -47,14 +49,10 @@ DEFAULT_PARAMS = {
     "vol_mult":        1.2,
     # ── Market structure (still computed for debugging, not used in signals) ─
     "swing_len":       3,
-    # ── VWAP bounce entry trigger ──────────────────────────────────────────
-    # Low must be within this % above VWAP for a long bounce to count.
-    # High must be within this % below VWAP for a short rejection to count.
-    "vwap_touch_pct":  0.003,   # 0.3 % proximity band
     # ── Risk management ────────────────────────────────────────────────────
     "atr_len":         14,
-    "tp_mult":         1.5,     # TP at 1.5× ATR — 5m moves are larger; good R:R
-    "sl_mult":         1.0,     # SL at 1× ATR  — tight since entry is at VWAP support
+    "tp_mult":         1.5,     # TP at 1.5× ATR — ride breakout momentum
+    "sl_mult":         1.0,     # SL at 1× ATR  — tight stop below breakout level
     "limit_offset_pct": 0.02,
     "max_bars":        12,      # 12 × 5m = 60-minute time stop
     # ── Exchange / account ─────────────────────────────────────────────────
