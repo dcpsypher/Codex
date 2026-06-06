@@ -35,6 +35,9 @@ DEFAULT_PARAMS = {
     "st_atr_len":      7,
     # ── Breakout entry ─────────────────────────────────────────────────────
     "breakout_len":    20,      # Donchian lookback — break prior 20-bar range
+    # ── Regime filter ──────────────────────────────────────────────────────
+    "adx_len":         14,
+    "adx_min":         25,      # only trade breakouts when ADX > this (strong trend)
     # ── Momentum (RSI used only as an exhaustion guard now) ────────────────
     "rsi_len":         14,
     "rsi_long_lo":     40,

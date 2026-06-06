@@ -48,12 +48,17 @@ def generate_signals(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     # ── Volume confirmation ───────────────────────────────────────────────────
     vol_ok = df["volume"] > params["vol_mult"] * df["vol_sma"]
 
+    # ── Regime filter — only trade breakouts in a strong trend ────────────────
+    # Low ADX = chop, where breakouts whipsaw (the false-breakout trap that sank
+    # the unfiltered v3). Requiring ADX above a floor skips ranging conditions.
+    adx_ok = df["adx"] > params.get("adx_min", 25)
+
     # ── Combined signals (position check handled by engine) ───────────────────
     df["long_cond"] = (
-        ema_bull & breakout_long & rsi_long_ok & vol_ok
+        ema_bull & breakout_long & rsi_long_ok & vol_ok & adx_ok
     )
     df["short_cond"] = (
-        ema_bear & breakout_short & rsi_short_ok & vol_ok
+        ema_bear & breakout_short & rsi_short_ok & vol_ok & adx_ok
     )
 
     # Fill NaN from indicator warm-up as False

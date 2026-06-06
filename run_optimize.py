@@ -72,7 +72,7 @@ def main() -> None:
         f"  TP mult       = [cyan]{best['tp_mult']}[/cyan]\n"
         f"  SL mult       = [cyan]{best['sl_mult']}[/cyan]\n"
         f"  Breakout len  = [cyan]{best['breakout_len']}[/cyan]\n"
-        f"  RSI Long cap  = [cyan]{best['rsi_long_hi']}[/cyan]\n"
+        f"  ADX min       = [cyan]{best['adx_min']}[/cyan]\n"
         f"  Vol mult      = [cyan]{best['vol_mult']}[/cyan]\n"
         f"  (All other params unchanged from defaults)\n"
     )

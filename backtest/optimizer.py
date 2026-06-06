@@ -35,7 +35,7 @@ PARAM_GRID = {
     "tp_mult":       [1.5, 2.0, 2.5],
     "sl_mult":       [0.8, 1.0, 1.2],
     "breakout_len":  [10, 20, 30],
-    "rsi_long_hi":   [70, 75, 80],
+    "adx_min":       [20, 25, 30],
     "vol_mult":      [1.0, 1.2, 1.5],
 }
 

@@ -52,6 +52,11 @@ i_emaSlow    = input.int(21,    "EMA Slow Length",          group = "Trend",    
 i_breakoutLen = input.int(20,   "Breakout Lookback (bars)", group = "Breakout",         minval = 3,
      tooltip = "Close must break the highest high / lowest low of this many prior bars to trigger.")
 
+// — Regime Filter —
+i_adxLen     = input.int(14,    "ADX Length",               group = "Regime Filter",    minval = 2)
+i_adxMin     = input.float(25,  "ADX Minimum",              group = "Regime Filter",    step = 1, minval = 0,
+     tooltip = "Only trade breakouts when ADX is above this. Low ADX = chop, where breakouts whipsaw.")
+
 // — Momentum —
 i_rsiLen     = input.int(14,    "RSI Length",               group = "Momentum",         minval = 2)
 i_rsiLongHi  = input.int(75,    "RSI Long Max",             group = "Momentum",         tooltip = "Don't buy breakouts above this RSI (too extended)")
@@ -91,6 +96,10 @@ emaBear = emaFast < emaSlow
 // Momentum — RSI (exhaustion guard only)
 rsi = ta.rsi(close, i_rsiLen)
 
+// Regime — ADX (trend strength)
+[diPlus, diMinus, adxVal] = ta.dmi(i_adxLen, i_adxLen)
+adxOk = adxVal > i_adxMin
+
 // Volume confirmation
 volSma = ta.sma(volume, i_volLen)
 volOk  = volume > i_volMult * volSma
@@ -114,12 +123,14 @@ breakoutShort = close < priorLow
 
 longSignal = emaBull                                        // EMA: fast uptrend
           and breakoutLong                                  // Break prior N-bar high
+          and adxOk                                         // Regime: strong trend
           and rsi < i_rsiLongHi                             // RSI: not over-extended
           and volOk                                         // Volume: real participation
           and strategy.position_size == 0                   // No open position
 
 shortSignal = emaBear
            and breakoutShort
+           and adxOk
            and rsi > i_rsiShortLo
            and volOk
            and strategy.position_size == 0
@@ -244,7 +255,7 @@ bgcolor(strategy.position_size > 0 ? color.new(color.green, 94)
 var table dash = table.new(
      position     = position.top_right,
      columns      = 2,
-     rows         = 12,
+     rows         = 13,
      bgcolor      = color.new(color.black, 70),
      border_color = color.new(color.gray, 50),
      border_width = 1,
@@ -311,3 +322,8 @@ if barstate.islast
     rsiClr = rsi > 70 ? color.red : rsi < 30 ? color.red : color.white
     table.cell(dash, 0, 11, "RSI",          text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 11, rsiTxt,         text_color = rsiClr,       text_size = size.tiny)
+
+    adxTxt = str.tostring(math.round(adxVal, 1)) + (adxOk ? " ✓" : " ✗")
+    adxClr = adxOk ? color.lime : color.gray
+    table.cell(dash, 0, 12, "ADX",          text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 12, adxTxt,         text_color = adxClr,       text_size = size.tiny)

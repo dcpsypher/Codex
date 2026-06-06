@@ -39,6 +39,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from backtest.indicators import (  # noqa: E402
+    adx,
     atr,
     ema,
     macd,
@@ -82,6 +83,8 @@ class ConfluenceScalper(IStrategy):
     st_atr_len     = 7
     st_factor      = 3.0
     breakout_len   = 20      # Donchian lookback — break prior 20-bar range
+    adx_len        = 14
+    adx_min        = 25      # only trade breakouts when ADX > this (strong trend)
     rsi_len        = 14
     rsi_long_lo    = 40
     rsi_long_hi    = 75      # don't buy breakouts above this RSI (too extended)
@@ -149,6 +152,9 @@ class ConfluenceScalper(IStrategy):
         # ── ATR ────────────────────────────────────────────────────────────────
         dataframe["atr"] = atr(df["high"], df["low"], df["close"], self.atr_len).values
 
+        # ── ADX (trend-strength regime filter) ──────────────────────────────────
+        dataframe["adx"] = adx(df["high"], df["low"], df["close"], self.adx_len).values
+
         return dataframe
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -165,10 +171,14 @@ class ConfluenceScalper(IStrategy):
         breakout_long  = df["close"] > prior_high
         breakout_short = df["close"] < prior_low
 
+        # ── Regime filter — only trade breakouts in a strong trend ─────────────
+        adx_ok = df["adx"] > self.adx_min
+
         # ── Long ───────────────────────────────────────────────────────────────
         long_cond = (
             (df["ema_fast"] > df["ema_slow"])    &   # fast-EMA uptrend
             breakout_long                        &   # break prior 20-bar high
+            adx_ok                               &   # strong-trend regime
             (df["rsi"] < self.rsi_long_hi)       &   # not too extended
             vol_ok                               &   # volume confirmed
             (df["volume"] > 0)
@@ -180,6 +190,7 @@ class ConfluenceScalper(IStrategy):
         short_cond = (
             (df["ema_fast"] < df["ema_slow"])    &   # fast-EMA downtrend
             breakout_short                       &   # break prior 20-bar low
+            adx_ok                               &   # strong-trend regime
             (df["rsi"] > self.rsi_short_lo)      &   # not too extended
             vol_ok                               &   # volume confirmed
             (df["volume"] > 0)

@@ -40,6 +40,33 @@ def rsi(close: pd.Series, period: int) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """
+    Average Directional Index (Wilder's) — trend-strength gauge in [0, 100].
+    Matches ta.adx(period) in Pine Script v6. High ADX (>25) = strong trend;
+    low ADX (<20) = chop/range. Used as a regime filter for breakout entries.
+    """
+    up_move   = high.diff()
+    down_move = -low.diff()
+
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0),   up_move,   0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm  = pd.Series(plus_dm,  index=high.index)
+    minus_dm = pd.Series(minus_dm, index=high.index)
+
+    tr  = true_range(high, low, close)
+    atr_ = rma(tr, period)
+
+    plus_di  = 100.0 * rma(plus_dm,  period) / atr_.replace(0, np.nan)
+    minus_di = 100.0 * rma(minus_dm, period) / atr_.replace(0, np.nan)
+
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    return rma(dx, period)
+
+
 def macd(
     close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -260,5 +287,8 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
 
     # ── ATR (for SL/TP sizing) ─────────────────────────────────────────────
     df["atr"] = atr(df["high"], df["low"], df["close"], params["atr_len"])
+
+    # ── ADX (trend-strength regime filter) ─────────────────────────────────
+    df["adx"] = adx(df["high"], df["low"], df["close"], params.get("adx_len", 14))
 
     return df
